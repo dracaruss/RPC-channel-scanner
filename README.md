@@ -159,6 +159,12 @@ sudo "$(which python3)" rpcauthmap.py 'CORP/alice:Passw0rd@10.0.0.50' \
 | `--no-color` | disable ANSI color |
 | `-o FILE` | append plain-text (no color) results to a file |
 
+On --brute: Use it selectively, when a pipe you care about refuses the MGMT query so ifids comes back empty but you still want to know which known interfaces it serves. It is extra noise and extra binds, so it is a per-host or hardened-target tool, not something to leave on for a wide sweep.
+
+On --coerce: You need an EFS, DFS or FSRVP host for a real active fire (PrintSpooler doen't auto-fire).
+
+On the timeout: Lower is faster because it is the per-connect wait, so dead ports and hosts fail sooner across a sweep. Too low risks missing slow hosts, and note the global socket floor is max of five or timeout plus two, so dropping below three still bottoms out around five seconds on actual socket operations. On a fast LAN one or two is fine, over VPN keep it higher.
+
 ---
 
 ## Reading the output
