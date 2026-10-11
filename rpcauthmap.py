@@ -1097,9 +1097,9 @@ def render_engagement_summary(results):
                                     + [len(rhead)])
 
     out = []
-    out.append(c('=' * total, C.BOLD + C.CYAN))
-    out.append(c('  SUMMARY', C.BOLD + C.CYAN))
-    out.append(c('=' * total, C.BOLD + C.CYAN))
+    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
+    out.append('  %s' % c('SUMMARY', C.BOLD + C.CYAN))
+    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
     out.append('  %s%s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(sep, C.GREY),
                              c(rhead, C.BOLD)))
     out.append('  %s' % c('-' * total, C.GREY))
@@ -1107,7 +1107,7 @@ def render_engagement_summary(results):
         lcell = left[i] if i < len(left) else ''
         rcell = right[i] if i < len(right) else ''
         out.append('  %s%s%s' % (_vis_pad(lcell, lwidth), c(sep, C.GREY), rcell))
-    out.append(c('=' * total, C.BOLD + C.CYAN))
+    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
     return '\n'.join(out)
 
 
