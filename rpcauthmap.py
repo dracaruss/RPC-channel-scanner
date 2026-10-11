@@ -110,6 +110,7 @@ class C:
     YELLOW = '\033[33m'
     CYAN = '\033[36m'
     GREY = '\033[90m'
+    BBLUE = '\033[94m'  # bright blue
 
 
 _NOCOLOR = False
@@ -803,10 +804,10 @@ class RPCAuthMap(object):
         # ---------------- render ---------------- #
         lines.append(c('[*] %s' % host, C.BOLD + C.CYAN))
 
-        # == COERCION SOURCE ==
-        lines.append(c('  == COERCION SOURCE ==', C.BOLD + C.CYAN))
-        lines.append(c('     can this host be made to authenticate to you? '
-                       '(its own SMB signing does NOT matter here)', C.GREY))
+        # == IS THIS A COERCION SOURCE ==
+        lines.append(c('  == IS THIS A COERCION SOURCE ==', C.BOLD + C.CYAN))
+        lines.append(c('     Can this host be made to authenticate to you?',
+                       C.GREY))
         if coercibles:
             for e in coercibles:
                 if e['confirmed'] is True:
@@ -816,14 +817,14 @@ class RPCAuthMap(object):
                 else:
                     verdict = c('CANDIDATE', C.YELLOW)
                 lines.append('     %s  %s  %s'
-                             % (verdict, c(e['label'], C.BOLD),
+                             % (verdict, c(e['label'], C.BBLUE),
                                 c(e['uuid'], C.GREY)))
-                lines.append(c('        why: %s' % e['how'], C.GREY))
+                lines.append(c('        Why: %s' % e['how'], C.GREY))
                 if not e['auto']:
-                    lines.append(c('        note: needs a handle sequence, not '
+                    lines.append(c('        Note: needs a handle sequence, not '
                                    'auto-fired; trigger with printerbug', C.GREY))
         else:
-            lines.append(c('     none  (no coercible interface exposed)', C.GREEN))
+            lines.append(c('     No. No coercible interface exposed.', C.GREEN))
 
         # == RELAY DESTINATION ==
         sign_txt = ('REQUIRED' if smb_signing is True else 'not required'
@@ -832,8 +833,6 @@ class RPCAuthMap(object):
                     if smb_signing is False else C.GREY)
         lines.append(c('  == RELAY DESTINATION ==', C.BOLD + C.CYAN))
         lines.append('     %s' % c('SMB signing: %s' % sign_txt, sign_col))
-        lines.append(c('     could you relay a captured NTLM auth INTO this host? '
-                       'VIABLE = nothing signs the path', C.GREY))
         if relay_viables:
             for r in relay_viables:
                 how = ('direct TCP, no SMB layer' if not r['is_pipe']
@@ -858,7 +857,7 @@ class RPCAuthMap(object):
         esc8 = []
         if self.relay_checks:
             lines.append(c('  == CROSS-PROTOCOL RELAY TARGETS ==', C.BOLD + C.CYAN))
-            lines.append(c('     where a coerced machine account could be relayed '
+            lines.append(c('     Where a coerced machine account could be relayed '
                            'for domain takeover', C.GREY))
 
             ls = check_ldap_signing(host, self.timeout)
@@ -897,32 +896,32 @@ class RPCAuthMap(object):
         lines.append(c('  == CONCLUSION ==', C.BOLD + C.CYAN))
         if coercibles:
             cnames = ', '.join(e['label'] for e in coercibles)
-            lines.append(c('     coercible via: %s' % cnames, C.YELLOW))
-            lines.append(c('       reason: exposes an RPC method that reaches out '
+            lines.append(c('     Coercible via: %s' % cnames, C.YELLOW))
+            lines.append(c('       Reason: exposes an RPC method that reaches out '
                            'to a UNC you supply', C.GREY))
         else:
-            lines.append(c('     coercible: none found on this host', C.GREY))
+            lines.append(c('     Coercible: none found on this host', C.GREY))
         if relay_viables:
             tcpn = sum(1 for r in relay_viables if not r['is_pipe'])
-            lines.append(c('     relay target: %d endpoint(s), %d over direct TCP'
+            lines.append(c('     Relay target: %d endpoint(s), %d over direct TCP'
                            % (len(relay_viables), tcpn), C.BRED))
-            lines.append(c('       reason: these accept an unsigned bind and TCP '
+            lines.append(c('       Reason: these accept an unsigned bind and TCP '
                            'has no SMB signing in the path', C.GREY))
         elif smb_signing is True:
-            lines.append(c('     relay target: none; SMB signing closes the pipe '
+            lines.append(c('     Relay target: none; SMB signing closes the pipe '
                            'relays (coerce this host, relay ELSEWHERE instead)',
                            C.GREY))
         else:
-            lines.append(c('     relay target: none viable', C.GREY))
+            lines.append(c('     Relay target: none viable', C.GREY))
         if self.relay_checks:
             if ldap_viable:
-                lines.append(c('     cross-protocol: %s relay-viable here'
+                lines.append(c('     Cross-protocol: %s relay-viable here'
                                % ', '.join(ldap_viable), C.BRED))
                 if coercibles:
-                    lines.append(c('       full chain: coerce this host, relay '
+                    lines.append(c('       Full chain: coerce this host, relay '
                                    'to %s for takeover' % ldap_viable[0], C.GREY))
             else:
-                lines.append(c('     cross-protocol: no LDAP/LDAPS/ADCS relay '
+                lines.append(c('     Cross-protocol: no LDAP/LDAPS/ADCS relay '
                                'path open here', C.GREY))
 
         if self.show_all and detail_rows:
@@ -1048,16 +1047,29 @@ def _rand_tag():
     return 'x%d' % (int(time.time() * 1000) % 100000)
 
 
+def _vis_pad(s, width):
+    """Pad a (possibly colored) string to a visible width."""
+    pad = width - len(strip_ansi(s))
+    return s + (' ' * pad if pad > 0 else '')
+
+
 def render_engagement_summary(results):
-    """Build the final colored wrap-up: coercible sources, relay destinations,
-    and the coerce->relay chains between them."""
-    sources = []   # (ip, labels, confirmed_bool)
-    dests = []     # (ip, [type tags])
+    """Final wrap-up: two side-by-side columns, coercible IPs on the left and
+    relay destinations on the right."""
+    left = []   # coercible-source cells
+    right = []  # relay-destination cells
+    grant = {'LDAP': 'RBCD/shadow-creds', 'LDAPS': 'RBCD/shadow-creds',
+             'ADCS-ESC8': 'cert then PKINIT/PassTheCert',
+             'SMB/RPC': 'privileged USER auth only'}
+
     for r in results:
         if r.get('coercibles'):
             labels = ', '.join(e['label'] for e in r['coercibles'])
             conf = any(e.get('confirmed') for e in r['coercibles'])
-            sources.append((r['host'], labels, conf))
+            verdict = (c('CONFIRMED', C.BOLD + C.GREEN) if conf
+                       else c('candidate', C.YELLOW))
+            left.append('%s  %s  %s' % (c(r['host'], C.BRED), verdict,
+                                        c(labels, C.BBLUE)))
 
         tags = []
         if r.get('ldap') and 'NOT required' in (r['ldap'] or ''):
@@ -1069,72 +1081,31 @@ def render_engagement_summary(results):
         if r.get('rpc_relay'):
             tags.append('SMB/RPC')
         if tags:
-            dests.append((r['host'], tags))
+            gtxt = '; '.join('%s=%s' % (t, grant[t]) for t in tags)
+            right.append('%s  %s' % (c(r['host'], C.BRED),
+                                     c(' '.join(tags), C.BOLD)
+                                     + c('  (%s)' % gtxt, C.GREY)))
 
-    if not sources and not dests:
+    if not left and not right:
         return ''
 
+    # Column widths from visible lengths.
+    lhead = 'COERCIBLE IPs'
+    rhead = 'RELAY DESTINATIONS'
+    lwidth = max([len(strip_ansi(x)) for x in left] + [len(lhead)]) + 2
+    rows = max(len(left), len(right))
+
     out = []
-    out.append(c('=' * 60, C.BOLD + C.CYAN))
-    out.append(c('  ENGAGEMENT SUMMARY', C.BOLD + C.CYAN))
-    out.append(c('=' * 60, C.BOLD + C.CYAN))
-
-    # --- coercible sources ---
-    out.append(c('  COERCIBLE SOURCES (make these authenticate to you):',
-                 C.BOLD))
-    if sources:
-        wip = max(len(s[0]) for s in sources)
-        for ip, labels, conf in sources:
-            verdict = (c('CONFIRMED', C.BOLD + C.GREEN) if conf
-                       else c('candidate', C.YELLOW))
-            out.append('    %s  %s  %s'
-                       % (c(ip.ljust(wip), C.BRED), verdict,
-                          c(labels, C.GREY)))
-    else:
-        out.append(c('    none', C.GREY))
-
-    # --- relay destinations ---
-    out.append(c('  RELAY DESTINATIONS (accept a relayed NTLM auth):', C.BOLD))
-    grant = {'LDAP': 'RBCD/shadow-creds', 'LDAPS': 'RBCD/shadow-creds',
-             'ADCS-ESC8': 'cert then PKINIT/PassTheCert',
-             'SMB/RPC': 'needs a privileged user, not a machine acct'}
-    if dests:
-        wip = max(len(d[0]) for d in dests)
-        for ip, tags in dests:
-            gtxt = '; '.join('%s=%s' % (t, grant[t]) for t in tags)
-            out.append('    %s  %s'
-                       % (c(ip.ljust(wip), C.BRED),
-                          c(' '.join(tags), C.BOLD) + c('  (%s)' % gtxt,
-                                                        C.GREY)))
-    else:
-        out.append(c('    none found', C.GREY))
-
-    # --- chains ---
-    out.append(c('  CHAINS (coerce -> relay):', C.BOLD))
-    ldap_dests = [(ip, tags) for ip, tags in dests
-                  if any(t in ('LDAP', 'LDAPS', 'ADCS-ESC8') for t in tags)]
-    if sources and ldap_dests:
-        for ip, labels, conf in sources:
-            tgts = ', '.join('%s[%s]' % (dip, '/'.join(
-                t for t in tags if t in ('LDAP', 'LDAPS', 'ADCS-ESC8')))
-                for dip, tags in ldap_dests)
-            out.append('    %s %s %s'
-                       % (c(ip, C.BRED), c('->', C.GREY),
-                          c('relay to: ' + tgts, C.BOLD)))
-    elif sources and not ldap_dests:
-        out.append(c('    coercible sources found, but no LDAP/LDAPS/ADCS relay '
-                     'destination (run with --relay-checks against the DC/CA)',
-                     C.GREY))
-    else:
-        out.append(c('    no complete coerce->relay chain found', C.GREY))
-
-    smb_dests = [ip for ip, tags in dests if 'SMB/RPC' in tags]
-    if smb_dests:
-        out.append(c('    SMB/RPC relay targets (for a privileged USER auth, '
-                     'e.g. a poisoned/coerced admin, NOT a machine account): %s'
-                     % ', '.join(smb_dests), C.GREY))
-
-    out.append(c('=' * 60, C.BOLD + C.CYAN))
+    out.append(c('=' * 72, C.BOLD + C.CYAN))
+    out.append(c('  SUMMARY', C.BOLD + C.CYAN))
+    out.append(c('=' * 72, C.BOLD + C.CYAN))
+    out.append('  %s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(rhead, C.BOLD)))
+    out.append('  %s' % c('-' * (lwidth + len(rhead)), C.GREY))
+    for i in range(rows):
+        lcell = left[i] if i < len(left) else ''
+        rcell = right[i] if i < len(right) else ''
+        out.append('  %s%s' % (_vis_pad(lcell, lwidth), rcell))
+    out.append(c('=' * 72, C.BOLD + C.CYAN))
     return '\n'.join(out)
 
 
