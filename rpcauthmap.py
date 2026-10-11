@@ -806,8 +806,6 @@ class RPCAuthMap(object):
 
         # == IS THIS A COERCION SOURCE ==
         lines.append(c('  == IS THIS A COERCION SOURCE ==', C.BOLD + C.CYAN))
-        lines.append(c('     Can this host be made to authenticate to you?',
-                       C.GREY))
         if coercibles:
             for e in coercibles:
                 if e['confirmed'] is True:
@@ -831,7 +829,7 @@ class RPCAuthMap(object):
                     if smb_signing is False else 'unknown')
         sign_col = (C.GREEN if smb_signing is True else C.RED
                     if smb_signing is False else C.GREY)
-        lines.append(c('  == RELAY DESTINATION ==', C.BOLD + C.CYAN))
+        lines.append(c('  == IS THIS A RELAY DESTINATION ==', C.BOLD + C.CYAN))
         lines.append('     %s' % c('SMB signing: %s' % sign_txt, sign_col))
         if relay_viables:
             for r in relay_viables:
@@ -846,10 +844,10 @@ class RPCAuthMap(object):
                 if rnote:
                     lines.append(c('        use: %s' % rnote, C.CYAN))
         elif smb_signing is True:
-            lines.append(c('     none  (SMB signing REQUIRED blocks every '
-                           'named-pipe relay on this host)', C.GREEN))
+            lines.append(c('     No. SMB signing REQUIRED blocks every '
+                           'named-pipe relay on this host.', C.GREEN))
         else:
-            lines.append(c('     none viable', C.GREEN))
+            lines.append(c('     No viable relay destination.', C.GREEN))
 
         # == CROSS-PROTOCOL RELAY TARGETS (LDAP / LDAPS / ADCS) ==
         ldap_viable = []
@@ -1089,23 +1087,27 @@ def render_engagement_summary(results):
     if not left and not right:
         return ''
 
-    # Column widths from visible lengths.
+    # Column widths from visible lengths, with a padded gap and a separator.
     lhead = 'COERCIBLE IPs'
     rhead = 'RELAY DESTINATIONS'
-    lwidth = max([len(strip_ansi(x)) for x in left] + [len(lhead)]) + 2
+    sep = '   |   '
+    lwidth = max([len(strip_ansi(x)) for x in left] + [len(lhead)]) + 4
     rows = max(len(left), len(right))
+    total = lwidth + len(sep) + max([len(strip_ansi(x)) for x in right]
+                                    + [len(rhead)])
 
     out = []
-    out.append(c('=' * 72, C.BOLD + C.CYAN))
+    out.append(c('=' * total, C.BOLD + C.CYAN))
     out.append(c('  SUMMARY', C.BOLD + C.CYAN))
-    out.append(c('=' * 72, C.BOLD + C.CYAN))
-    out.append('  %s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(rhead, C.BOLD)))
-    out.append('  %s' % c('-' * (lwidth + len(rhead)), C.GREY))
+    out.append(c('=' * total, C.BOLD + C.CYAN))
+    out.append('  %s%s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(sep, C.GREY),
+                             c(rhead, C.BOLD)))
+    out.append('  %s' % c('-' * total, C.GREY))
     for i in range(rows):
         lcell = left[i] if i < len(left) else ''
         rcell = right[i] if i < len(right) else ''
-        out.append('  %s%s' % (_vis_pad(lcell, lwidth), rcell))
-    out.append(c('=' * 72, C.BOLD + C.CYAN))
+        out.append('  %s%s%s' % (_vis_pad(lcell, lwidth), c(sep, C.GREY), rcell))
+    out.append(c('=' * total, C.BOLD + C.CYAN))
     return '\n'.join(out)
 
 

@@ -5,16 +5,16 @@ An RPC authentication-coercion and NTLM-relay surface mapper for Windows network
 `rpcauthmap.py` answers two questions about a host or a whole subnet, and then ties
 them together:
 
-1. **Can this host be made to authenticate to me?** (a coercion *source*)
-2. **Can a captured NTLM authentication be relayed *into* this host?** (a relay
-   *destination*), and if so, what does that get an attacker?
+1. **Is this a coercion source?** Can the host be made to authenticate to you.
+2. **Is this a relay destination?** Can a captured NTLM authentication be relayed
+   into the host, and if so, what does that get an attacker.
 
 It discovers every reachable RPC interface (not just the ones the endpoint mapper
 advertises), classifies what each one is and what it is good for, probes whether a
 relay would actually land, optionally fires the coercion to prove it, optionally
 checks the cross-protocol relay destinations (LDAP, LDAPS, ADCS ESC8), and prints a
-final engagement summary mapping which coercible source can be relayed to which
-destination.
+final summary that lists coercible IPs on the left and relay destinations on the
+right.
 
 > **Authorized testing only.** The `--coerce` mode actively induces target machines
 > to authenticate to you, and `--relay-checks` binds to LDAP/LDAPS. Only run this
@@ -24,7 +24,7 @@ destination.
 
 ## What it does, stage by stage
 
-**Stage 1 - Discovery (the full RPC surface, not just the advertised part).**
+**Stage 1 — Discovery (the full RPC surface, not just the advertised part).**
 - Reads the endpoint mapper (TCP/135), which gives each registered interface and its
   exact bindings, including the dynamic `ncacn_ip_tcp` high port.
 - Enumerates named pipes over SMB (`\\host\IPC$`), which surfaces pipes the endpoint
@@ -38,13 +38,15 @@ destination.
   reverse) is still found. Application/IPC pipe noise (Chrome, VMware, crashpad,
   mojo, bare-GUID pipes, etc.) is filtered out.
 
-**Stage 2 - Classification.**
+**Stage 2 — Classification.**
 Every UUID is mapped to a human name where known, flagged as a coercion source if it
 exposes a method that takes a remote-target argument (a UNC path, a `\\server`, or a
 share), and annotated with a short attacker-oriented `use:` note explaining what
-reaching or relaying into it buys you.
+reaching or relaying into it buys you. Interface binds use each interface's real
+version, and interfaces reachable only via local RPC are labeled `local only
+(ncalrpc)` rather than probed.
 
-**Stage 3 - Relay-destination probe.**
+**Stage 3 — Relay-destination probe.**
 For each interface, the tool binds at escalating authentication levels to find the
 lowest the server accepts (its enforced *floor*):
 
@@ -60,32 +62,34 @@ is not a barrier. For **named-pipe** endpoints the real gate is **SMB signing**
 (reported per host), because a pipe rides an SMB session; for **direct TCP**
 endpoints there is no SMB layer, so the RPC floor is the only gate.
 
-**Stage 4 - Active coercion probe (opt-in `--coerce`).**
+**Stage 4 — Active coercion probe (opt-in `--coerce`).**
 Stands up a local callback listener, calls each coercible interface's trigger with a
 UNC pointing back at you, and reports **CONFIRMED** when the target actually connects
 back, **LIKELY** when the call was accepted but no callback arrived, or **CANDIDATE**
 when it was not fired (for example MS-RPRN, which needs an open-printer handle
 sequence).
 
-**Stage 5 - Cross-protocol relay destinations (opt-in `--relay-checks`).**
+**Stage 5 — Cross-protocol relay destinations (opt-in `--relay-checks`).**
 Per host, probes:
-- **LDAP signing (389)** - `NOT required` means relay here to write RBCD or shadow
+- **LDAP signing (389)** — `NOT required` means relay here to write RBCD or shadow
   credentials.
-- **LDAPS channel binding / EPA (636)** - `NOT required` means the HTTPS-origin relay
+- **LDAPS channel binding / EPA (636)** — `NOT required` means the HTTPS-origin relay
   path for the same directory writes.
-- **ADCS ESC8** - checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
+- **ADCS ESC8** — checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
   a web-enrollment endpoint you can relay to for a certificate.
 
 These run against **every** host scanned; a host that is not a DC or CA fails the
 port pre-check and returns `closed` fast.
 
-**Engagement summary.**
-After the sweep, a colored wrap-up lists all coercible source IPs, all relay
-destination IPs with what each grants, and the coerce→relay chains between them, e.g.
+**Summary.**
+After the sweep, a colored two-column table lists every coercible IP on the left and
+every relay destination on the right, each destination tagged with what it grants:
 
 ```
-  CHAINS (coerce -> relay):
-    10.0.0.1 -> relay to: 10.2.0.3[LDAP], 10.0.4.5[ADCS-ESC8]
+  SUMMARY
+  COERCIBLE IPs                             |   RELAY DESTINATIONS
+  10.121.158.120  candidate  MS-RPRN        |   10.2.0.3  LDAP  (RBCD/shadow-creds)
+  10.0.4.5  CONFIRMED  MS-EFSR              |   10.0.4.5  ADCS-ESC8  (cert then PKINIT)
 ```
 
 ---
@@ -159,11 +163,19 @@ sudo "$(which python3)" rpcauthmap.py 'CORP/alice:Passw0rd@10.0.0.50' \
 | `--no-color` | disable ANSI color |
 | `-o FILE` | append plain-text (no color) results to a file |
 
-On --brute: Use it selectively, when a pipe you care about refuses the MGMT query so ifids comes back empty but you still want to know which known interfaces it serves. It is extra noise and extra binds, so it is a per-host or hardened-target tool, not something to leave on for a wide sweep.
+**On `--brute`:** use it selectively, when a pipe you care about refuses the MGMT
+query so `ifids` comes back empty but you still want to know which known interfaces
+it serves. It is extra noise and extra binds, so it is a per-host or hardened-target
+tool, not something to leave on for a wide sweep.
 
-On --coerce: You need an EFS, DFS or FSRVP host for a real active fire (PrintSpooler doen't auto-fire).
+**On `--coerce`:** you need an EFS, DFS or FSRVP host for a real active fire. The
+print spooler (MS-RPRN) does not auto-fire, so it only ever shows as a candidate.
 
-On the timeout: Lower is faster because it is the per-connect wait, so dead ports and hosts fail sooner across a sweep. Too low risks missing slow hosts, and note the global socket floor is max of five or timeout plus two, so dropping below three still bottoms out around five seconds on actual socket operations. On a fast LAN one or two is fine, over VPN keep it higher.
+**On `-timeout`:** lower is faster because it is the per-connect wait, so dead ports
+and hosts fail sooner across a sweep. Too low risks missing slow hosts, and note the
+global socket floor is the larger of five or `timeout + 2`, so dropping below three
+still bottoms out around five seconds on actual socket operations. On a fast LAN one
+or two is fine, over VPN keep it higher.
 
 ---
 
@@ -171,17 +183,18 @@ On the timeout: Lower is faster because it is the per-connect wait, so dead port
 
 Each host prints three sections:
 
-- **COERCION SOURCE** - can this host be made to authenticate to you. This host's own
-  SMB signing is irrelevant here.
-- **RELAY DESTINATION** - can you relay a captured NTLM auth into this host. This is
-  the only place SMB signing matters, because signing gates the machine you relay
-  *into*, not the machine you coerce *out of*.
-- **CONCLUSION** - what is coercible and why, and what can be a relay target and why.
+- **IS THIS A COERCION SOURCE** — can this host be made to authenticate to you. This
+  host's own SMB signing is irrelevant here.
+- **IS THIS A RELAY DESTINATION** — can you relay a captured NTLM auth into this host.
+  This is the only place SMB signing matters, because signing gates the machine you
+  relay *into*, not the machine you coerce *out of*.
+- **CONCLUSION** — what is coercible and why, and what can be a relay target and why.
 
 With `--relay-checks`, a **CROSS-PROTOCOL RELAY TARGETS** section is added (LDAP,
 LDAPS, ADCS). With `--show-all`, a full **ALL INTERFACES** dump is appended, where
 `local only (ncalrpc)` marks interfaces reachable only from a process on the box and
-therefore not testable over the network.
+therefore not testable over the network. The run ends with the two-column **SUMMARY**
+table described above.
 
 ---
 
@@ -197,11 +210,12 @@ therefore not testable over the network.
 - MS-RPRN (the spooler) is reported as a coercion **candidate** rather than
   auto-fired, because its trigger needs an open-printer handle sequence. Use a
   dedicated printerbug tool to fire it.
-- The coerce→relay chains pair every coercible source with every LDAP/LDAPS/ADCS
-  destination, which is valid in the general machine-account case. The tool does not
-  prove a specific source has rights at a specific destination; that is your call per
-  target. SMB/RPC relay targets are listed separately and labeled as useful for a
-  privileged *user* auth, not a coerced machine account.
+- The summary lists coercible sources and relay destinations side by side; it does
+  not prove a specific source has rights at a specific destination, which is your
+  call per target. The directory and certificate destinations (LDAP, LDAPS, ADCS)
+  are the ones that matter for a coerced **machine** account; SMB/RPC relay targets
+  are tagged separately as useful for a privileged **user** auth, not a machine
+  account.
 
 ---
 
