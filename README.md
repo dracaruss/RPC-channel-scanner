@@ -24,7 +24,7 @@ right.
 
 ## What it does, stage by stage
 
-**Stage 1 — Discovery (the full RPC surface, not just the advertised part).**
+**Stage 1 - Discovery (the full RPC surface, not just the advertised part).**
 - Reads the endpoint mapper (TCP/135), which gives each registered interface and its
   exact bindings, including the dynamic `ncacn_ip_tcp` high port.
 - Enumerates named pipes over SMB (`\\host\IPC$`), which surfaces pipes the endpoint
@@ -38,7 +38,7 @@ right.
   reverse) is still found. Application/IPC pipe noise (Chrome, VMware, crashpad,
   mojo, bare-GUID pipes, etc.) is filtered out.
 
-**Stage 2 — Classification.**
+**Stage 2 - Classification.**
 Every UUID is mapped to a human name where known, flagged as a coercion source if it
 exposes a method that takes a remote-target argument (a UNC path, a `\\server`, or a
 share), and annotated with a short attacker-oriented `use:` note explaining what
@@ -46,7 +46,7 @@ reaching or relaying into it buys you. Interface binds use each interface's real
 version, and interfaces reachable only via local RPC are labeled `local only
 (ncalrpc)` rather than probed.
 
-**Stage 3 — Relay-destination probe.**
+**Stage 3 - Relay-destination probe.**
 For each interface, the tool binds at escalating authentication levels to find the
 lowest the server accepts (its enforced *floor*):
 
@@ -62,20 +62,20 @@ is not a barrier. For **named-pipe** endpoints the real gate is **SMB signing**
 (reported per host), because a pipe rides an SMB session; for **direct TCP**
 endpoints there is no SMB layer, so the RPC floor is the only gate.
 
-**Stage 4 — Active coercion probe (opt-in `--coerce`).**
+**Stage 4 - Active coercion probe (opt-in `--coerce`).**
 Stands up a local callback listener, calls each coercible interface's trigger with a
 UNC pointing back at you, and reports **CONFIRMED** when the target actually connects
 back, **LIKELY** when the call was accepted but no callback arrived, or **CANDIDATE**
 when it was not fired (for example MS-RPRN, which needs an open-printer handle
 sequence).
 
-**Stage 5 — Cross-protocol relay destinations (opt-in `--relay-checks`).**
+**Stage 5 - Cross-protocol relay destinations (opt-in `--relay-checks`).**
 Per host, probes:
-- **LDAP signing (389)** — `NOT required` means relay here to write RBCD or shadow
+- **LDAP signing (389)** - `NOT required` means relay here to write RBCD or shadow
   credentials.
-- **LDAPS channel binding / EPA (636)** — `NOT required` means the HTTPS-origin relay
+- **LDAPS channel binding / EPA (636)** - `NOT required` means the HTTPS-origin relay
   path for the same directory writes.
-- **ADCS ESC8** — checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
+- **ADCS ESC8** - checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
   a web-enrollment endpoint you can relay to for a certificate.
 
 These run against **every** host scanned; a host that is not a DC or CA fails the
@@ -183,12 +183,12 @@ or two is fine, over VPN keep it higher.
 
 Each host prints three sections:
 
-- **IS THIS A COERCION SOURCE** — can this host be made to authenticate to you. This
+- **IS THIS A COERCION SOURCE** - can this host be made to authenticate to you. This
   host's own SMB signing is irrelevant here.
-- **IS THIS A RELAY DESTINATION** — can you relay a captured NTLM auth into this host.
+- **IS THIS A RELAY DESTINATION** - can you relay a captured NTLM auth into this host.
   This is the only place SMB signing matters, because signing gates the machine you
   relay *into*, not the machine you coerce *out of*.
-- **CONCLUSION** — what is coercible and why, and what can be a relay target and why.
+- **CONCLUSION** - what is coercible and why, and what can be a relay target and why.
 
 With `--relay-checks`, a **CROSS-PROTOCOL RELAY TARGETS** section is added (LDAP,
 LDAPS, ADCS). With `--show-all`, a full **ALL INTERFACES** dump is appended, where
