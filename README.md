@@ -177,11 +177,11 @@ at whatever interfaces it finds, looking for a coercion method that is not in an
 published catalog. It is loud and throttled. Always look first with `--dry-run`, which
 sends nothing:
 
-_hunt_ actively fires too. Both modes end in a live firing stage against the host and both watch the same listener for a callback. The difference is which methods each one fires and how carefully.
+**`hunt`** actively fires too. Both modes end in a live firing stage against the host and both watch the same listener for a callback. The difference is which methods each one fires and how carefully.
 
-_coerce_ fires the five curated entries only, and it fires each one the correct way, with the exact argument the method expects and, for the spooler, the full two-call handle sequence. It is a short, deliberate, high-signal list of methods that are known to coerce.
+**`coerce`** fires the five curated entries only, and it fires each one the correct way, with the exact argument the method expects and, for the spooler, the full two-call handle sequence. It is a short, deliberate, high-signal list of methods that are known to coerce.
 
-_hunt_ fires the broad candidate library instead. For every interface it discovers on the target that appears in that built-in list, it blind-fires each listed method with a UNC jammed into the string slot, as a single generic call, and watches for the callback. It is a wide, speculative net rather than a curated one.
+**`hunt`** fires the broad candidate library instead. For every interface it discovers on the target that appears in that built-in list, it blind-fires each listed method with a UNC jammed into the string slot, as a single generic call, and watches for the callback. It is a wide, speculative net rather than a curated one.
 
 The two overlap on the simple methods but neither is contained in the other. A documented vector whose trigger is a single string call, like the EFS one, can appear in both, fired precisely by coerce and sprayed blindly by hunt. But hunt deliberately skips every method that needs a handle, a struct, or a multi-step setup, because a single blind call cannot satisfy those. That is exactly the category the spooler falls into, so hunt can never fire the printerbug sequence. Only coerce can, now that it is wired.
 
