@@ -17,7 +17,7 @@ that are not in any published catalog, optionally checks the cross-protocol rela
 destinations (LDAP, LDAPS, ADCS ESC8), and prints a final summary that lists
 coercible IPs on the left and relay destinations on the right.
 
-> **Authorized testing only.** The `coerce` and `hunt` modes actively induce target
+> The `coerce` and `hunt` modes actively induce target
 > machines to authenticate to you, and every mode binds to LDAP/LDAPS for the relay
 > checks. `hunt` in particular blindly fires RPC methods and can hang or crash a
 > service. Only run this against systems you are explicitly authorized to test.
@@ -26,7 +26,7 @@ coercible IPs on the left and relay destinations on the right.
 
 ## What it does, stage by stage
 
-**Stage 1 — Discovery (the full RPC surface, not just the advertised part).**
+**Stage 1 - Discovery (the full RPC surface, not just the advertised part).**
 - Reads the endpoint mapper (TCP/135), which gives each registered interface and its
   exact bindings, including the dynamic `ncacn_ip_tcp` high port.
 - Enumerates named pipes over SMB (`\\host\IPC$`), which surfaces pipes the endpoint
@@ -40,7 +40,7 @@ coercible IPs on the left and relay destinations on the right.
   reverse) is still found. Application/IPC pipe noise (Chrome, VMware, crashpad,
   mojo, bare-GUID pipes, etc.) is filtered out.
 
-**Stage 2 — Classification.**
+**Stage 2 - Classification.**
 Every UUID is mapped to a human name where known, flagged as a coercion source if it
 exposes a method that takes a remote-target argument (a UNC path, a `\\server`, or a
 share), and annotated with a short attacker-oriented `use:` note explaining what
@@ -48,7 +48,7 @@ reaching or relaying into it buys you. Interface binds use each interface's real
 version, and interfaces reachable only via local RPC are labeled `local only
 (ncalrpc)` rather than probed.
 
-**Stage 3 — Relay-destination probe.**
+**Stage 3 - Relay-destination probe.**
 For each interface, the tool binds at escalating authentication levels to find the
 lowest the server accepts (its enforced *floor*):
 
@@ -64,26 +64,26 @@ is not a barrier. For **named-pipe** endpoints the real gate is **SMB signing**
 (reported per host), because a pipe rides an SMB session; for **direct TCP**
 endpoints there is no SMB layer, so the RPC floor is the only gate.
 
-**Stage 4 — Cross-protocol relay destinations (part of every mode).**
+**Stage 4 - Cross-protocol relay destinations (part of every mode).**
 Per host, probes:
-- **LDAP signing (389)** — `NOT required` means relay here to write RBCD or shadow
+- **LDAP signing (389)** - `NOT required` means relay here to write RBCD or shadow
   credentials.
-- **LDAPS channel binding / EPA (636)** — `NOT required` means the HTTPS-origin relay
+- **LDAPS channel binding / EPA (636)** - `NOT required` means the HTTPS-origin relay
   path for the same directory writes.
-- **ADCS ESC8** — checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
+- **ADCS ESC8** - checks whether `http(s)://<host>/certsrv/` answers with NTLM, i.e.
   a web-enrollment endpoint you can relay to for a certificate.
 
 These run against **every** host scanned; a host that is not a DC or CA fails the
 port pre-check and returns `closed` fast.
 
-**Stage 5 — Active coercion, "level 1" (`coerce` mode).**
+**Stage 5 - Active coercion, "level 1" (`coerce` mode).**
 Stands up a local callback listener, calls each coercible interface's trigger with a
 UNC pointing back at you, and reports **CONFIRMED** when the target actually connects
 back, **LIKELY** when the call was accepted but no callback arrived, or **CANDIDATE**
 when it was not fired (for example MS-RPRN, which needs an open-printer handle
 sequence). These are the curated, proven methods whose exact argument is hardcoded.
 
-**Stage 6 — Targeted fuzz, "level 2" (`hunt` mode).**
+**Stage 6 - Targeted fuzz, "level 2" (`hunt` mode).**
 This is the part that goes past a fixed catalog. The tool carries a built-in candidate
 list (compiled from an NtObjectManager IDL dump of a Windows 11 box), and for every
 interface it actually discovers on the target that also appears in that list, it
@@ -281,14 +281,14 @@ methods at a live domain controller is both loud and capable of disrupting a ser
 
 Each host prints these sections:
 
-- **IS THIS A COERCION SOURCE** — can this host be made to authenticate to you. This
+- **IS THIS A COERCION SOURCE** - can this host be made to authenticate to you. This
   host's own SMB signing is irrelevant here.
-- **IS THIS A RELAY DESTINATION** — can you relay a captured NTLM auth into this host.
+- **IS THIS A RELAY DESTINATION** - can you relay a captured NTLM auth into this host.
   This is the only place SMB signing matters, because signing gates the machine you
   relay *into*, not the machine you coerce *out of*.
-- **CROSS-PROTOCOL RELAY TARGETS** — the LDAP, LDAPS, and ADCS relay paths, shown in
+- **CROSS-PROTOCOL RELAY TARGETS** - the LDAP, LDAPS, and ADCS relay paths, shown in
   every mode.
-- **CONCLUSION** — what is coercible and why, and what can be a relay target and why.
+- **CONCLUSION** - what is coercible and why, and what can be a relay target and why.
 
 In `hunt` mode a **LEVEL-2 FUZZ (UNVERIFIED)** section lists each candidate method
 that was fired and its verdict, with the confirmed and likely hits first and the
