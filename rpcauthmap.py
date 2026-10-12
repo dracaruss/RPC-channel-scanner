@@ -1978,16 +1978,41 @@ def expand_targets(spec):
     return targets
 
 
-def _default_src_ip():
-    """Best-guess local IP the target would route back to (no traffic sent)."""
+def _default_src_ip(target_hint=None):
+    """Best-guess local IP the target would route back to (no traffic sent).
+
+    Opens a UDP socket toward a destination and reads the kernel-chosen source
+    address; nothing is actually transmitted. We try the real target first,
+    because it is guaranteed routable (we are about to scan it), then a public
+    IP, then the old broadcast address. The broadcast address alone can fail
+    with 'Network is unreachable' when no matching route exists, which is why
+    auto-detection used to come up empty on some setups."""
+    dests = []
+    if target_hint:
+        # strip any creds@ prefix and :port, keep the bare host/IP
+        h = target_hint.split('@')[-1].split('/')[-1]
+        h = h.split(':')[0].strip('[]')
+        if h and not h.startswith('@'):
+            dests.append(h)
+    dests += ['8.8.8.8', '10.255.255.255']
+    for dest in dests:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((dest, 1))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and ip != '0.0.0.0':
+                return ip
+        except Exception:
+            continue
+    # Last resort: resolve our own hostname.
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('10.255.255.255', 1))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith('127.'):
+            return ip
     except Exception:
-        return None
+        pass
+    return None
 
 
 def main():
@@ -2133,7 +2158,11 @@ def main():
     # A dry run fires nothing, so it needs no listener in either mode.
     needs_listener = (options.coerce or options.fuzz) and not options.fuzz_dry_run
     if needs_listener and not options.listener_ip:
-        options.listener_ip = _default_src_ip()
+        # spec is the bare host/CIDR/list after the creds@ prefix (if any);
+        # use the first target as the routing hint.
+        _hint = spec.split(',')[0] if '@' in options.target else \
+            options.target.split(',')[0]
+        options.listener_ip = _default_src_ip(_hint)
         if not options.listener_ip:
             sys.stderr.write('[-] Could not auto-detect your callback IP; pass '
                              '--listener-ip.\n')
