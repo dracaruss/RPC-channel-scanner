@@ -1502,8 +1502,6 @@ class RPCAuthMap(object):
         esc8 = []
         if self.relay_checks:
             lines.append(c('  == CROSS-PROTOCOL RELAY TARGETS ==', C.BOLD + C.CYAN))
-            lines.append(c('     Where a coerced machine account could be relayed '
-                           'for domain takeover', C.GREY))
 
             ls = check_ldap_signing(host, self.timeout)
             lcol = (C.BRED if 'NOT required' in ls else C.GREEN
