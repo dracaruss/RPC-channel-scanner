@@ -2075,6 +2075,7 @@ def main():
         print(c('    Pacing: %.1fs + up to %.1fs jitter per call, max %d/host.'
                 % (options.fuzz_delay, options.fuzz_jitter, options.fuzz_max),
                 C.GREY))
+    _run_start = time.time()
     print(c('[*] Sweeping %d host(s) with %d thread(s)...'
             % (len(targets), options.threads), C.CYAN))
     print('')
@@ -2141,12 +2142,23 @@ def main():
         print('')
         print(summary)
 
+    elapsed = time.time() - _run_start
+    if elapsed >= 60:
+        elapsed_txt = '%dm %.1fs' % (int(elapsed // 60), elapsed % 60)
+    else:
+        elapsed_txt = '%.1fs' % elapsed
+    done = '[*] Run completed in %s' % elapsed_txt
+
     if outfh:
         outfh.write(strip_ansi(s1) + '\n' + strip_ansi(s2) + '\n')
         if summary:
             outfh.write('\n' + strip_ansi(summary) + '\n')
+        outfh.write(done + '\n')
         outfh.close()
         print(c('[*] Plain-text results appended to %s' % options.output, C.CYAN))
+
+    # very last line of the run
+    print(c(done, C.CYAN))
 
 
 if __name__ == '__main__':
