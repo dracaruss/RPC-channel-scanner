@@ -1229,10 +1229,18 @@ class RPCAuthMap(object):
             dce.bind(uuidtup_to_bin(descriptor['uuidtup']))
         except Exception as e:
             self._dbg('coerce-bind %s via %s' % (method_name, pipe), host, e)
+            es = str(e)
+            if 'STATUS_OBJECT_NAME_NOT_FOUND' in es:
+                reason = ('\\PIPE\\%s not present (the backing service is not '
+                          'running on the target)' % pipe)
+            elif 'STATUS_ACCESS_DENIED' in es or 'access_denied' in es.lower():
+                reason = ('access denied opening \\PIPE\\%s with these '
+                          'credentials' % pipe)
+            else:
+                reason = es.split('\n')[0][:70]
             hits.append({'iface': descriptor['label'], 'pipe': pipe,
                          'method': method_name, 'confirmed': False,
-                         'status': 'nobind',
-                         'reason': str(e).split('\n')[0][:70]})
+                         'status': 'nobind', 'reason': reason})
             return
         status = 'error'
         reason = ''
