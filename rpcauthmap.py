@@ -1293,6 +1293,14 @@ class RPCAuthMap(object):
             if any(code in es for code in _EXPECTED_COERCE_ERRORS):
                 status = 'sent'
                 reason = 'reached out via %s (post-dial path error)' % transport_label
+            elif 'timed out' in es.lower() or 'timeout' in es.lower():
+                # The coercion call commonly BLOCKS while the server dials the
+                # UNC back, so a timeout is the expected signature of a firing
+                # coercion, not a failure. Mark it reached-out and let the
+                # listener confirm whether the dial actually hit us.
+                status = 'sent'
+                reason = ('call blocked on %s waiting for the server to dial '
+                          'back (coercion likely firing)' % transport_label)
             elif 'STATUS_ACCESS_DENIED' in es or 'access_denied' in es.lower():
                 status = 'error'
                 reason = ('fired via %s but access denied (account lacks the '
@@ -1305,9 +1313,12 @@ class RPCAuthMap(object):
                 dce.disconnect()
             except Exception:
                 pass
-        # Give the target a moment to dial the listener (only if the call went out).
+        # Watch the listener whenever we got far enough to fire. The callback
+        # often arrives DURING the (blocking) call, so we must check regardless
+        # of how the call returned, not only on a clean return. A bind failure
+        # returns earlier, so reaching here always means the call went out.
         confirmed = False
-        if status == 'sent' and self.listener:
+        if self.listener:
             deadline = time.time() + self.coerce_timeout
             while time.time() < deadline:
                 if self.listener.saw(host):
@@ -1605,11 +1616,11 @@ class RPCAuthMap(object):
                 if e['confirmed'] is True:
                     verdict = c('CONFIRMED', C.BOLD + C.GREEN)
                 elif e['confirmed'] is False:
-                    verdict = c('LIKELY (call sent, no callback)', C.YELLOW)
+                    verdict = c('LIKELY (reached out, no callback)', C.YELLOW)
                 elif e.get('attempted'):
-                    verdict = c('CANDIDATE (fire failed)', C.YELLOW)
+                    verdict = c('NOT CONFIRMED (fire did not complete)', C.YELLOW)
                 else:
-                    verdict = c('CANDIDATE', C.YELLOW)
+                    verdict = c('CANDIDATE (not fired)', C.YELLOW)
                 lines.append('     %s  %s  %s'
                              % (verdict, c(e['label'], C.BBLUE),
                                 c(e['uuid'], C.GREY)))
