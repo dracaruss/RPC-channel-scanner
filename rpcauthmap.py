@@ -1703,6 +1703,22 @@ class RPCAuthMap(object):
             lines.append(c('     Coercible via: %s' % cnames, C.YELLOW))
             lines.append(c('       Reason: exposes an RPC method that reaches out '
                            'to a UNC you supply', C.GREY))
+            # Carry the live-fire verdict so this agrees with the section above:
+            # "coercible" is the structural fact; the test result is the proof.
+            if self.do_coerce and not self.fuzz_dry_run:
+                conf = [e for e in coercibles if e['confirmed'] is True]
+                likely = [e for e in coercibles if e['confirmed'] is False]
+                if conf:
+                    lines.append(c('       Live test: CONFIRMED by callback (%s)'
+                                   % ', '.join(e['label'] for e in conf),
+                                   C.BOLD + C.GREEN))
+                elif likely:
+                    lines.append(c('       Live test: fired and the server '
+                                   'reached out, but no callback was captured '
+                                   '(LIKELY, not yet proven)', C.YELLOW))
+                else:
+                    lines.append(c('       Live test: fire did not complete this '
+                                   'run (vector valid, unproven)', C.GREY))
         else:
             lines.append(c('     Coercible: none found on this host', C.GREY))
         if relay_viables:
