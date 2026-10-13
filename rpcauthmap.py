@@ -1022,11 +1022,34 @@ class RPCAuthMap(object):
         self.coerce_timeout = coerce_timeout
 
     # ---- debug helper ----------------------------------------------------- #
+    def _errstr(self, err):
+        """Best-effort readable text for an impacket/socket exception. The bare
+        repr of SessionError/DCERPCSessionError is frequently empty, so pull the
+        NTSTATUS/fault name and code out of the object when it carries one."""
+        code = None
+        try:
+            code = err.getErrorCode()
+        except Exception:
+            code = None
+        name = ''
+        try:
+            es = err.getErrorString()
+            name = es[0] if isinstance(es, (tuple, list)) else str(es)
+        except Exception:
+            name = ''
+        if code is not None:
+            return ('%s (0x%08x)' % (name, code & 0xffffffff)).strip() \
+                if name else '0x%08x' % (code & 0xffffffff)
+        s = str(err).strip()
+        if s and s != '()':
+            return s
+        return err.__class__.__name__
+
     def _dbg(self, stage, host, err):
         if self.debug:
             with _print_lock:
-                sys.stderr.write(c('    [dbg %s %s] %r\n'
-                                   % (stage, host, err), C.GREY))
+                sys.stderr.write(c('    [dbg %s %s] %s\n'
+                                   % (stage, host, self._errstr(err)), C.GREY))
 
     # ---- credential helper ------------------------------------------------ #
     def _set_creds(self, rpctransport):
@@ -1242,17 +1265,17 @@ class RPCAuthMap(object):
         except Exception as e:
             self._dbg('coerce-bind %s via %s' % (method_name, transport_label),
                       host, e)
-            es = str(e)
+            es = self._errstr(e)
             if 'STATUS_OBJECT_NAME_NOT_FOUND' in es:
                 reason = ('\\PIPE\\%s not present (service may not be running '
                           'or pipe is firewalled)' % transport_label)
             elif 'STATUS_ACCESS_DENIED' in es or 'access_denied' in es.lower():
-                reason = ('access denied on %s with these credentials'
-                          % transport_label)
+                reason = ('access denied binding %s via %s'
+                          % (method_name, transport_label))
             elif 'timed out' in es.lower() or 'Connection refused' in es:
                 reason = '%s unreachable (timeout or refused)' % transport_label
             else:
-                reason = es.split('\n')[0][:70]
+                reason = 'bind via %s failed: %s' % (transport_label, es[:60])
             hits.append({'iface': descriptor['label'], 'pipe': transport_label,
                          'method': method_name, 'confirmed': False,
                          'status': 'nobind', 'reason': reason})
@@ -1264,15 +1287,19 @@ class RPCAuthMap(object):
             status = 'sent'
             reason = 'call accepted (no fault)'
         except Exception as e:
-            es = str(e)
+            es = self._errstr(e)
             self._dbg('coerce-fire %s via %s' % (method_name, transport_label),
                       host, e)
             if any(code in es for code in _EXPECTED_COERCE_ERRORS):
                 status = 'sent'
-                reason = 'post-dial error (reached out)'
+                reason = 'reached out via %s (post-dial path error)' % transport_label
+            elif 'STATUS_ACCESS_DENIED' in es or 'access_denied' in es.lower():
+                status = 'error'
+                reason = ('fired via %s but access denied (account lacks the '
+                          'right to call it)' % transport_label)
             else:
                 status = 'error'
-                reason = es.split('\n')[0][:70]
+                reason = 'fired via %s, faulted: %s' % (transport_label, es[:60])
         finally:
             try:
                 dce.disconnect()
@@ -1524,8 +1551,16 @@ class RPCAuthMap(object):
                         entry['confirmed'] = False       # reached out, no callback
                     else:
                         entry['confirmed'] = None         # could not bind/send
-                        entry['fail_reason'] = next(
-                            (h.get('reason') for h in hits if h.get('reason')), '')
+                        # Surface the transport that got furthest: a fire fault
+                        # (we bound, the call faulted) is more informative than a
+                        # bind failure on a different transport, so rank 'error'
+                        # ahead of 'nobind'.
+                        _rank = {'error': 0, 'sent': 1, 'nobind': 2}
+                        informative = sorted(
+                            (h for h in hits if h.get('reason')),
+                            key=lambda h: _rank.get(h.get('status'), 3))
+                        entry['fail_reason'] = (informative[0]['reason']
+                                                if informative else '')
                 coercibles.append(entry)
 
             if self.show_all:
