@@ -5,9 +5,9 @@ networks, and can run the ESC8 relay end to end from its own code.
 
 It answers two questions per host and ties them together:
 
-1. **Coercion source** — can this host be made to authenticate to you (spooler,
+1. **Coercion source** - can this host be made to authenticate to you (spooler,
    EFS, DFS, FSRVP, and more).
-2. **Relay destination** — can a captured authentication be relayed into this
+2. **Relay destination** - can a captured authentication be relayed into this
    host, and what does that grant (SMB/RPC, LDAP, LDAPS, ADCS ESC8).
 
 > Authorized testing only. `coerce`, `hunt`, and `esc8` actively induce machines
@@ -36,15 +36,15 @@ rpcauthmap.py <mode> [[domain/]user[:pass]@]<host|CIDR|list|@file> [options]
 Leave the password off to be prompted for it, which avoids shell-quoting issues
 with special characters. Mode defaults to `map`.
 
-- **map** (default, read-only) — discover and classify every interface, work out
+- **map** (default, read-only) - discover and classify every interface, work out
   what is a coercion source and what is a relay destination, and check LDAP,
   LDAPS, and ADCS. Safe to run across a whole subnet.
-- **coerce** — everything in map, then fire the known coercion methods and
+- **coerce** - everything in map, then fire the known coercion methods and
   confirm with a real callback.
-- **hunt** — everything in map, then blind-fire the built-in candidate list to
+- **hunt** - everything in map, then blind-fire the built-in candidate list to
   find undocumented coercion methods. Loud and throttled; always `--dry-run`
   first.
-- **esc8** — relay a coerced DC machine account into an AD CS web-enrollment host
+- **esc8** - relay a coerced DC machine account into an AD CS web-enrollment host
   to issue a certificate (one-shot domain takeover). Runs the relay, the
   coercion, and the enrollment from this tool's own code, so no signatured
   binary (certipy, ntlmrelayx, Rubeus) is dropped. It still alerts, it just does
@@ -65,9 +65,9 @@ rpcauthmap.py esc8 CORP/alice@10.0.0.50 --ca 10.0.0.60 --template DomainControll
 
 `map`, `coerce`, and `hunt` are quiet by default: a single live progress line
 while scanning, then the **SUMMARY**. The summary leads with the critical
-targets in colour — `DOMAIN CONTROLLERS`, `ADCS / ESC8` with its enrolment URL,
+targets in colour - `DOMAIN CONTROLLERS`, `ADCS / ESC8` with its enrolment URL,
 and a `>> TAKEOVER PATH` line naming the hosts a coerced machine account can be
-relayed into — followed by a two-column table of coercible IPs and relay
+relayed into - followed by a two-column table of coercible IPs and relay
 destinations.
 
 Add `-v` for the full per-host detail and debug errors. `-o FILE` always records
