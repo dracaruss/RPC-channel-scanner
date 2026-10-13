@@ -1987,10 +1987,37 @@ def render_engagement_summary(results):
     total = lwidth + len(sep) + max([len(strip_ansi(x)) for x in right]
                                     + [len(rhead)])
 
+    # Critical infrastructure callout: an LDAP responder is a domain controller,
+    # an NTLM-answering /certsrv is an AD CS web-enrollment host (ESC8), and any
+    # host whose LDAP/LDAPS signing is off or that exposes ESC8 is a relay sink
+    # for a coerced machine account, i.e. the domain-takeover target.
+    dc_ips = [r['host'] for r in results if 'required' in (r.get('ldap') or '')]
+    adcs = [r for r in results if r.get('esc8')]
+    takeover = sorted(set(
+        [r['host'] for r in results if 'NOT required' in (r.get('ldap') or '')]
+        + [r['host'] for r in results if 'NOT required' in (r.get('ldaps') or '')]
+        + [r['host'] for r in results if r.get('esc8')]))
+
     out = []
     out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
     out.append('  %s' % c('SUMMARY', C.BOLD + C.CYAN))
     out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
+    if dc_ips or adcs or takeover:
+        if dc_ips:
+            out.append('  %s %s'
+                       % (c('DOMAIN CONTROLLERS:', C.BOLD + C.YELLOW),
+                          c(', '.join(dc_ips), C.BRED)))
+        for r in adcs:
+            out.append('  %s %s   %s'
+                       % (c('ADCS / ESC8:       ', C.BOLD + C.YELLOW),
+                          c(r['host'], C.BRED),
+                          c(r['esc8'][0], C.GREY)))
+        if takeover:
+            out.append('  %s %s'
+                       % (c('>> TAKEOVER PATH:  ', C.BOLD + C.BRED),
+                          c('coerce any host, relay a machine account to '
+                            + ', '.join(takeover), C.YELLOW)))
+        out.append('  %s' % c('-' * total, C.GREY))
     out.append('  %s%s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(sep, C.GREY),
                              c(rhead, C.BOLD)))
     out.append('  %s' % c('-' * total, C.GREY))
@@ -2311,6 +2338,8 @@ def main():
 
     total_hits = total_coerce = hosts_scanned = hosts_quiet = 0
     results = []
+    done = 0
+    ntot = len(targets)
     with ThreadPoolExecutor(max_workers=max(1, options.threads)) as pool:
         futures = [pool.submit(worker, h) for h in targets]
         for fut in as_completed(futures):
@@ -2323,14 +2352,30 @@ def main():
                 total_coerce += coerce_count
             else:
                 hosts_quiet += 1
-            if status == 'scanned' or options.verbose:
-                block = '\n'.join(lines)
+            done += 1
+            # Per-host detail only prints to the console in verbose mode. The -o
+            # file always gets the full detail for scanned hosts so the record
+            # stays complete. Non-verbose keeps the console to a live progress
+            # line plus the final SUMMARY.
+            block = '\n'.join(lines)
+            if options.verbose and (status == 'scanned' or True):
                 with _print_lock:
                     print(block)
                     print('')
-                    if outfh:
-                        outfh.write(strip_ansi(block) + '\n\n')
-                        outfh.flush()
+            if outfh and (status == 'scanned' or options.verbose):
+                outfh.write(strip_ansi(block) + '\n\n')
+                outfh.flush()
+            if not options.verbose:
+                with _print_lock:
+                    pct = int(done * 100 / ntot) if ntot else 100
+                    bar = ('[*] Working %3d%%  (%d/%d probed)  %d live, '
+                           '%d coercible/relay endpoint(s)'
+                           % (pct, done, ntot, hosts_scanned, total_hits))
+                    sys.stderr.write('\r' + c(bar, C.CYAN) + '\x1b[K')
+                    sys.stderr.flush()
+    if not options.verbose:
+        sys.stderr.write('\n')
+        sys.stderr.flush()
 
     if listener:
         listener.stop()
