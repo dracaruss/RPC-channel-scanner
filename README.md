@@ -29,6 +29,55 @@ It is designed for **authorized security testing and RPC coercion research**. It
    - Checks SMB signing, LDAP signing, LDAPS channel binding, AD CS web authentication advertisement, and RPC `CONNECT` bind acceptance.
    - These are candidate/posture observations only. Destination authorization and practical relay impact remain unproven until separately validated.
 
+## The Three Modes
+
+Think of the three modes as three levels of testing.
+
+| Mode | What it does | How far it goes |
+|---|---|---|
+| `map` | Finds services and checks security settings. | Shows candidates. Does not prove coercion. |
+| `coerce` | Tests known coercion methods. | Can confirm specific methods with a tagged callback. |
+| `hunt` | Tests additional simple methods. | Looks for new coercion paths, but cannot test every function type. |
+
+### `map`: Understand the Environment
+
+Map discovers remote procedure call services through the endpoint mapper, named pipes, and service queries.
+
+It also checks:
+
+- File and pipe signing.
+- Directory signing and encrypted directory protections.
+- Certificate web enrollment exposure.
+- Whether your account can make a basic connection to discovered interfaces.
+
+It does **not** intentionally trigger coercion. It gives you a map of possible sources and destinations.
+
+### `coerce`: Prove Known Methods
+
+Coerce includes the map checks, then runs the tool’s curated methods, such as the printer and file-encryption triggers.
+
+It then waits for the target to connect back.
+
+A result becomes `CONFIRMED` only when the callback contains the correct attempt tag.
+
+This proves that a specific known method caused an outbound connection. It does **not** prove that relaying that connection will succeed.
+
+### `hunt`: Look for Additional Methods
+
+Hunt includes mapping, adds deeper interface discovery, and tries reviewed candidate methods.
+
+It changes one text argument at a time and watches for a tagged callback.
+
+It can find methods outside the curated list. However, it only handles simple requests. It cannot automatically handle every complex or multi-step function.
+
+### Practical Use
+
+1. Run `map` to understand the targets.
+2. Run `coerce` to validate known methods.
+3. Run `hunt` when you need deeper research.
+
+All three modes test only the targets you provide. None of them proves a complete relay or takeover chain by itself.
+
 ## Requirements
 
 - Python 3
