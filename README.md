@@ -15,6 +15,7 @@ It is designed for **authorized security testing and RPC coercion research**. It
 
 2. **Tests coercion methods**
    - `coerce` exercises 21 curated method variants across the EFSR, RPRN, DFSNM, FSRVP, and EVEN families.
+   - Printer notification methods and DFS methods that accept only a server name cannot carry a path tag. Their callbacks remain unconfirmed even when the connection followed the request.
    - `hunt` tests reviewed candidates and varies one string argument per attempt.
    - Unreviewed hunt candidates are skipped unless `--lab` is explicitly enabled.
 
@@ -150,6 +151,7 @@ SMB callbacks normally require the tool to bind TCP/445, which may require eleva
 
 - Only `coerce` and non-dry-run `hunt` intentionally trigger outbound authentication.
 - WebDAV mode observes HTTP authentication and WebDAV requests; it does not support HTTPS callbacks and does not assume that WebDAV removes the MIC.
+- The SMB observer supports unsigned callbacks. It does not support clients that require SMB signing.
 - MIC is reported as present or absent only when `msvAvFlags` can be parsed; otherwise it is `not determined`.
 - Hunt does not model every NDR type or stateful call sequence. Complex candidates may require manual setup.
 - Unknown methods and undocumented opnums can be Windows-build-specific.

