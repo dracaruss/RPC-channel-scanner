@@ -14,7 +14,7 @@ It is designed for **authorized security testing and RPC coercion research**. It
    - Supports named-pipe and direct-TCP RPC transports; `ncalrpc` is local-only.
 
 2. **Tests coercion methods**
-   - `coerce` exercises curated methods such as EFSR, RPRN, DFSNM, and FSRVP triggers.
+   - `coerce` exercises 21 curated method variants across the EFSR, RPRN, DFSNM, FSRVP, and EVEN families.
    - `hunt` tests reviewed candidates and varies one string argument per attempt.
    - Unreviewed hunt candidates are skipped unless `--lab` is explicitly enabled.
 
@@ -28,55 +28,6 @@ It is designed for **authorized security testing and RPC coercion research**. It
 4. **Maps relay posture**
    - Checks SMB signing, LDAP signing, LDAPS channel binding, AD CS web authentication advertisement, and RPC `CONNECT` bind acceptance.
    - These are candidate/posture observations only. Destination authorization and practical relay impact remain unproven until separately validated.
-
-## The Three Modes
-
-Think of the three modes as three levels of testing.
-
-| Mode | What it does | How far it goes |
-|---|---|---|
-| `map` | Finds services and checks security settings. | Shows candidates. Does not prove coercion. |
-| `coerce` | Tests known coercion methods. | Can confirm specific methods with a tagged callback. |
-| `hunt` | Tests additional simple methods. | Looks for new coercion paths, but cannot test every function type. |
-
-### `map`: Understand the Environment
-
-Map discovers remote procedure call services through the endpoint mapper, named pipes, and service queries.
-
-It also checks:
-
-- File and pipe signing.
-- Directory signing and encrypted directory protections.
-- Certificate web enrollment exposure.
-- Whether your account can make a basic connection to discovered interfaces.
-
-It does **not** intentionally trigger coercion. It gives you a map of possible sources and destinations.
-
-### `coerce`: Prove Known Methods
-
-Coerce includes the map checks, then runs the tool’s curated methods, such as the printer and file-encryption triggers.
-
-It then waits for the target to connect back.
-
-A result becomes `CONFIRMED` only when the callback contains the correct attempt tag.
-
-This proves that a specific known method caused an outbound connection. It does **not** prove that relaying that connection will succeed.
-
-### `hunt`: Look for Additional Methods
-
-Hunt includes mapping, adds deeper interface discovery, and tries reviewed candidate methods.
-
-It changes one text argument at a time and watches for a tagged callback.
-
-It can find methods outside the curated list. However, it only handles simple requests. It cannot automatically handle every complex or multi-step function.
-
-### Practical Use
-
-1. Run `map` to understand the targets.
-2. Run `coerce` to validate known methods.
-3. Run `hunt` when you need deeper research.
-
-All three modes test only the targets you provide. None of them proves a complete relay or takeover chain by itself.
 
 ## Requirements
 
@@ -168,12 +119,15 @@ Authenticated calls are not necessarily read-only. Valid methods may change stat
 
 | Result | Meaning |
 |---|---|
-| `CANDIDATE` | A potentially interesting interface or method; active behavior is not proven. |
-| `UNCONFIRMED (called, no callback)` | The RPC call was issued, but no callback was observed. |
-| `UNTAGGED CALLBACK` | A connection matched source/timing, but not the unique attempt tag. |
+| `NOT TESTED` | A known coercion service was found, but no coercion request was sent. This is the normal `map` result. |
+| `UNCONFIRMED` | A request was sent, but no callback with the matching attempt tag was received. |
+| `TEST INCOMPLETE` | The request could not be completed. Use `-v` or `--show-all` for the error. |
 | `CONFIRMED` | The callback path contained the unique tag for that attempt. |
-| `RPC relay CANDIDATE` | An authenticated `CONNECT` bind was accepted; useful method authorization was not tested. |
-| `unknown` / no callback | Inconclusive, not proof of protection or that coercion is impossible. |
+| `CANDIDATE` under relay checks | The supplied account made a basic RPC connection. Relayed access and service permissions were not tested. |
+| `POSSIBLE ESC8 TARGET` | AD CS web enrollment advertises NTLM or Negotiate authentication. Certificate issuance and domain compromise are not proven. |
+| `Not determined` | The check was inconclusive. This does not prove protection or that coercion is impossible. |
+
+Normal output hides method names, interface identifiers, and raw bindings. Use `--show-all` for those technical details. A closed LDAP or LDAPS port is reported as “Not checked,” not as a protection state.
 
 ## Useful options
 

